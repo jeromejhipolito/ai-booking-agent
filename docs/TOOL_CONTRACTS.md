@@ -151,3 +151,67 @@ tell the client that plainly rather than apologising for a failure.
 
 `reason`: `invalid_input` · `invalid_timestamp` · `invalid_window` · `service_not_found` ·
 `db_unavailable` · `timeout`
+
+---
+
+# 10 · Booking Agent Core (phase 2)
+
+The conversation. A channel adapter calls it with one turn and gets back one reply.
+
+```jsonc
+// in  — from 11_Booking_Telegram_Adapter, or any other channel
+{ "user_key": "telegram:8412",   // channel-scoped; memory and bookings are keyed on this
+  "chat_id": 8412,
+  "text": "can i get a haircut on tuesday around 2pm?" }
+```
+```jsonc
+// out
+{ "reply": "Lovely — a Haircut. What day suits you?",
+  "user_key": "telegram:8412", "chat_id": 8412 }
+```
+
+Adding a channel means writing an adapter that produces that input and sends that reply. The
+brain is never touched, and `user_key` keeps each channel's conversation separate.
+
+## What the model is asked for
+
+One call per turn, temperature 0, with a 20-turn window. It must answer with this and nothing
+else — a tolerant parser accepts a `{params:{…}}` wrapper and strips markdown fences, and
+anything it still cannot parse becomes a re-ask, never a booking:
+
+```jsonc
+{ "intent": "book|cancel|availability|kb|chitchat",
+  "service": null, "date": null, "time": null, "preferred_stylist": null,
+  "client_name": null, "client_phone": null, "booking_ref": null,
+  "unknown_service": false, "unknown_stylist": false,
+  "reply": "" }
+```
+
+`reply` is used **only** for `kb` and `chitchat`, and even then it is scrubbed of booking
+references and confirmation wording. For every booking intent the reply a customer reads is
+rendered from a tool's JSON result, so a price or a confirmation can only come from the database.
+
+## What happens after it
+
+| Step | Owner | Note |
+|---|---|---|
+| service / stylist name → id | code | exact match plus a small Filipino alias list. Never the nearest entry: a service we don't offer stays `null` and is named as unknown. |
+| date + time | code | a real calendar day, not in the past, within 90 days; a real 24-hour clock. |
+| "yes" | code | matched against an explicit affirmative list (`opo`, `sige`, `oo` included). `maybe` and `i think so` are not on it. |
+| authorisation to create | database | `bot_user_profile.pending_booking` — written when a summary was actually shown, expiring after 30 minutes, carrying the slot and the idempotency key. |
+| which tool runs | code | one call per turn, plus a second only when a create loses a race and alternatives are needed. |
+| the reply | code | rendered from the tool result for every booking intent. |
+
+## State that survives a turn
+
+`pending_booking` holds one of three things, and only the second can be confirmed into a booking:
+
+- `{"kind":"draft", …}` — the half-filled booking, so a turn where the model loses the thread
+  doesn't lose the customer's answers.
+- `{"kind":"book", "booking_key": …, "starts_at_utc": …, …}` — a summary was shown. A "yes"
+  books **this**, not whatever the model extracted on the confirming turn.
+- `{"kind":"cancel", "ref": …}` — a cancellation was read back and is awaiting a yes.
+
+The 20-turn model window lives separately, in n8n's own `n8n_chat_histories` table. Clearing a
+customer's memory means truncating **both** — wiping the profile alone leaves the model still
+remembering the old thread.

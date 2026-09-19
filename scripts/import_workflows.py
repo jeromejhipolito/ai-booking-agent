@@ -58,9 +58,15 @@ def main() -> int:
         else:
             wid = api("POST", "/workflows", payload)["id"]
             action = "created"
+        note = ""
         if ACTIVATE:
-            api("POST", f"/workflows/{wid}/activate")
-        print(f"{action:8} {wid}  {wf['name']}")
+            try:
+                api("POST", f"/workflows/{wid}/activate")
+            except SystemExit as e:
+                # A workflow whose credential you have not picked yet (the Telegram adapter,
+                # until you add a bot token) must not abort the import of everything else.
+                note = "  [not activated: " + str(e).split("\n")[-1].strip()[:60] + "]"
+        print(f"{action:8} {wid}  {wf['name']}{note}")
     return 0
 
 

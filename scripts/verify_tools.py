@@ -82,7 +82,10 @@ def R(label: str, tool: str, payload: dict):
 
 
 # --------------------------------------------------------------------------- fixture
-OWNED_KEYS = ("verify-", "race-", "doc-")   # booking keys this script is allowed to destroy
+OWNED_KEYS = ("verify-", "race-", "doc-", "telegram:chat-")
+"""Booking keys the verification scripts own and may destroy. `telegram:chat-` is what
+verify_chat.py mints, and both scripts share this fixture — leaving it out made a chat
+run's own leftovers look like a live salon's real data and refuse the next run."""
 
 
 def guard_is_demo_database():

@@ -1,0 +1,135 @@
+{
+  "name": "11 \u00b7 Channel: Telegram (adapter \u2192 Booking Agent Core)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "sched",
+      "name": "Every 10s",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// A localhost n8n cannot receive Telegram's push webhook, so we poll getUpdates and keep the\n// offset in workflow static data. deleteWebhook first, or getUpdates 409s forever.\n// Exactly ONE active workflow may poll a given bot token \u2014 two means double replies.\nconst token = $env.TELEGRAM_BOT_TOKEN;\nif (!token) return [];\nconst store = $getWorkflowStaticData('global');\ntry { await this.helpers.httpRequest({ method: 'POST', url: `https://api.telegram.org/bot${token}/deleteWebhook`, json: true }); } catch (e) {}\nlet res;\ntry {\n  res = await this.helpers.httpRequest({ method: 'GET', json: true,\n    url: `https://api.telegram.org/bot${token}/getUpdates`,\n    qs: { offset: store.offset || 0, timeout: 0, limit: 10, allowed_updates: JSON.stringify(['message']) } });\n} catch (e) { return []; }\nconst out = [];\nfor (const u of (res && res.result) || []) {\n  store.offset = u.update_id + 1;                 // advance even for updates we skip\n  const msg = u.message;\n  if (!msg || !msg.chat) continue;\n  const text = msg.text || '';\n  out.push({ json: {\n    user_key: `telegram:${msg.chat.id}`,\n    chat_id: msg.chat.id,\n    channel: 'telegram',\n    name: [msg.from && msg.from.first_name, msg.from && msg.from.last_name].filter(Boolean).join(' '),\n    // A sticker, photo or voice note has no text \u2014 say so rather than embedding undefined.\n    text: text || '(the customer sent something that is not text)',\n  } });\n}\nreturn out;\n"
+      },
+      "id": "poll",
+      "name": "Poll Telegram (getUpdates)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "TEJeu6nUC9Xg0adO",
+          "mode": "id",
+          "cachedResultName": "10 \u00b7 Booking Agent Core"
+        },
+        "options": {}
+      },
+      "id": "core",
+      "name": "Execute core",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        440,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "send",
+      "name": "Send reply (Telegram)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        660,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## 11 \u00b7 Channel: Telegram\\n\\nA thin adapter \u2014 transport only. It polls because a localhost n8n cannot receive Telegram's push webhook, and it holds the update offset in workflow static data.\\n\\n**Set `TELEGRAM_BOT_TOKEN` in the environment and activate exactly ONE workflow per bot token.** Two active pollers on one token means every customer gets two replies and every message is processed twice.\\n\\nThe `user_key` is `telegram:<chat id>`, so memory and bookings are scoped per channel: the same person on another channel is a different conversation.",
+        "height": 300,
+        "width": 700,
+        "color": 5
+      },
+      "id": "n2",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -360
+      ]
+    }
+  ],
+  "connections": {
+    "Every 10s": {
+      "main": [
+        [
+          {
+            "node": "Poll Telegram (getUpdates)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll Telegram (getUpdates)": {
+      "main": [
+        [
+          {
+            "node": "Execute core",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute core": {
+      "main": [
+        [
+          {
+            "node": "Send reply (Telegram)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {}
+}

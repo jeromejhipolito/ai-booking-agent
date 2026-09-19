@@ -76,3 +76,87 @@ read-only here and whose `git status` is asserted unchanged as part of AC-1.
 - [ ] D6 branch pushed; remote HEAD == local HEAD
 - [ ] D7 sibling repo untouched
 - [ ] D8 zero LLM nodes in any phase-1 workflow
+
+---
+
+# Hardening notes — phase 2/4 (the conversational layer)
+
+Same method: self-derived AC, the 9 gap-classes, and a `qa-engineer` adversarial matrix
+(95 candidate cases) triaged into must-builds, logged decisions and later-phase work.
+
+## Self-derived AC
+
+| AC | Given / When / Then |
+|---|---|
+| AC-1 | A greeting gets a warm reply, calls no tool and books nothing. |
+| AC-2 | A booking request is slot-filled ONE field per turn, read back in full, and creates a row only after an explicit yes. |
+| AC-3 | Asking for an occupied slot is declined in plain language and real, bookable alternatives are offered. |
+| AC-4 | A cancel is read back for confirmation, then frees the window. |
+| AC-5 | A question about the salon is answered only from the retrieved notes, with the real numbers. |
+| AC-6 | A question the notes do not cover — or that is not about the salon at all — is declined, not answered. |
+| AC-7 | The model's free text is never the source of a booking, a price or a confirmation. |
+
+## Hardened items (all ENG, all built)
+
+| # | Class | Requirement | Matrix case |
+|---|---|---|---|
+| H-A | state/lifecycle | A create is authorised by `bot_user_profile.pending_booking` — a row written only when the agent actually showed a read-back, expiring after 30 minutes — never by the model's `confirm` flag. | 22, 58, 59 |
+| H-B | idempotency | `booking_key` is minted with the read-back and stored in it, so a double-sent yes replays one booking, while a genuine re-book after a cancel gets a fresh key and succeeds. | 41, 42 |
+| H-C | security | Model-authored text (the only text a customer sees for `kb`/`chitchat`) is scrubbed of booking references and confirmation wording, the data-not-instructions rule is restated AFTER the notes, and the agent refuses anything outside the salon's remit. | 1, 2, 4, 5, 6, 7 |
+| H-D | permission | A cancel only ever resolves against the caller's OWN upcoming appointments; someone else's reference reads as not found and is never confirmed to exist. | 8, 9 |
+| H-E | data contract | Before any read-back or create, the caller's existing appointments are checked for the same service at the same moment — "you already have that" instead of "someone took it". | 94 |
+| H-F | integration | A failed embedding never becomes a retrieval: no vector, no notes, and the reply says it cannot look that up rather than answering from arbitrary chunks. | 76 |
+| H-G | ambiguous term | Service and stylist names are matched exactly (plus a small Filipino alias list), never to the nearest catalogue entry; an unmatched name is reported as unknown with the real options. | 23, 24, 25 |
+| H-H | boundary | Dates must be a real calendar day, not past, within 90 days; times must be a real 24-hour clock. | 26, 27, 29, 30 |
+| H-I | boundary | Messages are capped at 1200 characters, and an empty one never reaches the embedder. | 45, 47 |
+| H-J | state | The half-built booking is persisted server-side as a `draft`, so a turn where the model loses the thread does not lose the customer's answers. | 18, 77, 78 |
+| H-K | ambiguous term | An auto-assigned stylist is not treated as a preference: only a stylist the customer actually asked for is carried into a changed date. | 11, 89 |
+| H-L | negative | A bare affirmative can never be a change of mind, and a change of mind can never be a confirmation — a modified detail produces a NEW read-back. | 10, 12, 14 |
+| H-M | integration | A rate-limited or unreachable model is retried, then reported honestly as "busy", never as "I didn't understand" — which would make the customer rephrase a perfectly good message. | 77 |
+| H-N | data contract | Slot-grid misses ("2pm" on a 45-minute grid) offer the nearest real slot as an explicit yes/no rather than a bare refusal. | 28 |
+
+## Decisions taken (logged, not asked)
+
+| Decision | Chosen default | Why |
+|---|---|---|
+| KB retrieval threshold | **0.35 noise floor, top 3, and the prompt decides** — not the 0.55 the sibling repo uses | Measured on this corpus: in-scope questions score 0.395–0.656 and off-topic ones 0.282–0.491. The distributions overlap, so no threshold can separate them; at 0.55, eight of eleven legitimate questions would have been refused. A threshold that cannot be the decision-maker should not be asked to be one. |
+| Confirmation gate | the customer's own words, matched against an explicit affirmative list | An injected instruction can make the model emit `confirm:true`; it cannot make the customer type "yes". "maybe" and "i think so" are deliberately not on the list. |
+| Off-grid start times | offered the nearest slot within 45 minutes, as a yes/no | Every natural request ("2pm") misses a 45-minute grid anchored at opening. Refusing them all is technically correct and useless. |
+| Third-party bookings | the appointment carries the named person, and the caller can still cancel it | Booking for a partner or a child is the common case, not an edge case. |
+| Telegram adapter activation | shipped **inactive** | Only one poller may run per bot token, and this machine already runs another bot on the only token available. Activating it needs a dedicated @BotFather token. |
+
+## Affected-area blast radius
+
+Phase 1's four tools are the only existing code this phase consumes, and it consumes them
+through their published contract without modification — `git diff` touches no `workflows/2*.json`.
+The `bot_user_profile` and `kb_chunk` tables are new. The shared local n8n gains two workflows
+and one route on the dev harness; no existing workflow is edited. **Re-verified:** phase 1's
+own suite still passes unchanged after all phase-2 work.
+
+## Hardened items added during phase-2 verification
+
+Everything below was found by running the suite against a deliberately weak self-hosted model.
+Each one is a defect in the code *around* the model, and each would have shipped unnoticed
+behind a sharper one — which is the argument for testing with the weak one.
+
+| # | Class | Requirement | How it surfaced |
+|---|---|---|---|
+| H-O | data contract | The service is derived from the customer's own words first (names, English and Filipino aliases, and affix-tolerant roots so `magpagupit` → haircut); a model-proposed service is accepted only when the words support it or it matches the one already settled. | The model substituted a real service for "Brazilian blowout", and separately dropped "haircut" out of a sentence that plainly contained it. |
+| H-P | permission | Only a booking reference **the customer typed** is honoured. A reference the model echoed out of the conversation window is ignored. | An echoed stale `BK-…` beat the unambiguous "your one upcoming appointment" rule, so "cancel my appointment" answered "I can't find that booking". |
+| H-Q | ambiguous term | Agreement is tokenised — every word must be an agreement word or a filler, at least one carrying the agreement. | An exact-phrase list could never cover "Opo, sige"; tokenising covers it while still refusing "yes, but make it 3pm", which contains words that are neither. |
+| H-R | negative | Times are parsed out of whatever came back (`09:00`, `9:00 in the morning`, `2pm`, `14:00-14:45`) rather than pattern-matched, and a validation failure is never sticky. | A rejected time was carried forward every turn, so the agent asked for the time forever while the customer kept answering it. |
+| H-S | state | A bare name or phone number answering a question we just asked is claimed by the code whatever field the model filed it under. | The model put the customer's own name in `preferred_stylist`, so telling the agent your name got "I don't have a stylist by that name". |
+| H-T | state | A half-built draft is only a baseline while the customer stays on the same service; asking for something else drops it rather than merging underneath. | A stale draft leaked its service into an unrelated later request. |
+
+## Decision taken on the chat model
+
+**Shipped:** a self-hosted `qwen2.5:7b-instruct` on Ollama, with `Chat Model (Groq)` and
+`Chat Model (OpenRouter)` wired and disabled beside it on the canvas.
+
+Groq's `openai/gpt-oss-20b` is faster and noticeably sharper at the extraction. It is not the
+default for two reasons. First, both hosted free tiers meter **tokens** per minute, and a
+multi-turn suite of 38 assertions exceeds that within about a minute — measured, after pacing
+attempts from 1.5s up to 22s between messages, which only stretched the run to an hour without
+completing it. Second, and more to the point: everything that is allowed to be wrong here is the
+model, so the default should be the weakest plausible one. Swapping to a hosted model is two
+clicks and can only improve the numbers.
