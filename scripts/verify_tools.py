@@ -13,12 +13,14 @@ Exit code is the number of failures (0 = all green).
 from __future__ import annotations
 
 import json
+import pathlib
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 HARNESS = "http://localhost:5678/webhook/salon-tool"
 CONTAINER = "booking-pg-local"
 DB = ["-U", "n8n", "-d", "salon_booking"]
@@ -80,13 +82,43 @@ def R(label: str, tool: str, payload: dict):
 
 
 # --------------------------------------------------------------------------- fixture
+OWNED_KEYS = ("verify-", "race-", "doc-")   # booking keys this script is allowed to destroy
+
+
+def guard_is_demo_database():
+    """Refuse to run anywhere that holds real bookings.
+
+    reset() deletes chat-created appointments, which is exactly right against the demo fixture
+    and catastrophic against a live salon. Two conditions must hold: the demo seed is present,
+    and every chat booking already belongs to this script.
+    """
+    if psql("select count(*) from stylist where id in ('sty_maria','sty_joy','sty_ruel','sty_bea')") != "4":
+        raise SystemExit(
+            "refusing to run: this database does not contain the demo seed "
+            "(deploy/seed-demo-salon.sql). verify_tools.py deletes chat bookings and is only "
+            "safe against a demo fixture."
+        )
+    stray = psql(
+        "select count(*) from appointment where source = 'chat' and ("
+        "booking_key is null or " +
+        " and ".join(f"booking_key not like '{k}%'" for k in OWNED_KEYS) + ")"
+    )
+    if stray != "0":
+        raise SystemExit(
+            f"refusing to run: {stray} chat booking(s) here were not created by this script. "
+            "That looks like real data — point this at a throwaway database."
+        )
+
+
 def reset():
     """Back to the seeded state: drop what earlier runs booked, re-apply the seed."""
-    psql("DELETE FROM appointment WHERE booking_key LIKE 'verify-%' OR source = 'chat'")
+    psql("DELETE FROM appointment WHERE source = 'chat' AND ("
+         + " or ".join(f"booking_key like '{k}%'" for k in OWNED_KEYS) + ")")
     psql("DELETE FROM client WHERE id LIKE 'cli_%' AND id NOT LIKE 'cli_demo_%'")
     seed = subprocess.run(
         ["docker", "exec", "-i", CONTAINER, "psql", *DB, "-q", "-v", "ON_ERROR_STOP=1"],
-        stdin=open("deploy/seed-demo-salon.sql"), capture_output=True, text=True,
+        # Resolved against the repo, not the shell's cwd — the script must work from anywhere.
+        stdin=open(ROOT / "deploy" / "seed-demo-salon.sql"), capture_output=True, text=True,
     )
     if seed.returncode != 0:
         raise RuntimeError("seed failed: " + seed.stderr)
@@ -101,6 +133,7 @@ def local_date(offset_days: int) -> str:
 
 
 def main() -> int:
+    guard_is_demo_database()
     reset()
     TUE, MON, WED = local_date(1), local_date(0), local_date(2)
 
