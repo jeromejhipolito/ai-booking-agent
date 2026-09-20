@@ -1,0 +1,170 @@
+{
+  "name": "11 · Channel: Telegram (adapter → Booking Agent Core)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "sched",
+      "name": "Every 10s",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// NOTE: this node must NOT set alwaysOutputData. Returning [] is the normal case — no token, no\n// new messages — and n8n would turn that empty result into one empty item, running a full agent\n// turn (embedding + pgvector + LLM) against a phantom customer every ten seconds, forever.\n// A localhost n8n cannot receive Telegram's push webhook, so we poll getUpdates and keep the\n// offset in workflow static data. deleteWebhook first, or getUpdates 409s forever.\n// Exactly ONE active workflow may poll a given bot token — two means double replies.\n// $env is blocked in Code nodes on a default install (the deploy compose turns it on with\n// N8N_BLOCK_ENV_ACCESS_IN_NODE=false). Read it defensively: no token simply means this\n// adapter has nothing to poll, not a workflow that throws every 10 seconds.\nlet token = '';\ntry { token = $env.TELEGRAM_BOT_TOKEN || ''; } catch (e) { token = ''; }\nif (!token) return [];\nconst store = $getWorkflowStaticData('global');\ntry { await this.helpers.httpRequest({ method: 'POST', url: `https://api.telegram.org/bot${token}/deleteWebhook`, json: true }); } catch (e) {}\nlet res;\ntry {\n  res = await this.helpers.httpRequest({ method: 'GET', json: true,\n    url: `https://api.telegram.org/bot${token}/getUpdates`,\n    qs: { offset: store.offset || 0, timeout: 0, limit: 10, allowed_updates: JSON.stringify(['message']) } });\n} catch (e) { return []; }\nconst out = [];\nfor (const u of (res && res.result) || []) {\n  store.offset = u.update_id + 1;                 // advance even for updates we skip\n  const msg = u.message;\n  if (!msg || !msg.chat) continue;\n  const text = msg.text || '';\n  out.push({ json: {\n    user_key: `telegram:${msg.chat.id}`,\n    chat_id: msg.chat.id,\n    channel: 'telegram',\n    name: [msg.from && msg.from.first_name, msg.from && msg.from.last_name].filter(Boolean).join(' '),\n    // A sticker, photo or voice note has no text — say so rather than embedding undefined.\n    text: text || '(the customer sent something that is not text)',\n  } });\n}\n// Static data is only written back when the execution ENDS, so a run that overlaps this one\n// would re-read the same updates and reply twice. Confirm them with Telegram right now: a\n// getUpdates at a higher offset IS Telegram's acknowledgement, and makes re-delivery\n// impossible regardless of what n8n does with the static store. An update that arrives in\n// between comes back here, is ignored, and is picked up by the next tick — never lost.\nif ((res && res.result || []).length) {\n  try {\n    await this.helpers.httpRequest({ method: 'GET', json: true,\n      url: `https://api.telegram.org/bot${token}/getUpdates`,\n      qs: { offset: store.offset, timeout: 0, limit: 1 } });\n  } catch (e) {}\n}\nreturn out;\n"
+      },
+      "id": "poll",
+      "name": "Poll Telegram (getUpdates)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "@@WF:10 · Booking Agent Core@@",
+          "mode": "id",
+          "cachedResultName": "10 · Booking Agent Core"
+        },
+        "options": {}
+      },
+      "id": "core",
+      "name": "Execute core",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        660,
+        160
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "send",
+      "name": "Send reply (Telegram)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        880,
+        160
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## 11 · Channel: Telegram\\n\\nA thin adapter — transport only. It polls because a localhost n8n cannot receive Telegram's push webhook, and it holds the update offset in workflow static data.\\n\\n**Set `TELEGRAM_BOT_TOKEN` in the environment and activate exactly ONE workflow per bot token.** Two active pollers on one token means every customer gets two replies and every message is processed twice.\\n\\nThe `user_key` is `telegram:<chat id>`, so memory and bookings are scoped per channel: the same person on another channel is a different conversation.",
+        "height": 300,
+        "width": 700,
+        "color": 5
+      },
+      "id": "n2",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -360
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "loop",
+      "name": "One message at a time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        440,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Every 10s": {
+      "main": [
+        [
+          {
+            "node": "Poll Telegram (getUpdates)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll Telegram (getUpdates)": {
+      "main": [
+        [
+          {
+            "node": "One message at a time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute core": {
+      "main": [
+        [
+          {
+            "node": "Send reply (Telegram)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One message at a time": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Execute core",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send reply (Telegram)": {
+      "main": [
+        [
+          {
+            "node": "One message at a time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {}
+}

@@ -1,0 +1,128 @@
+{
+  "name": "20 \u00b7 tool: find availability",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "trigger",
+      "name": "When called by the agent",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Phase 1 is deterministic: no LLM decides anything here.\n// Every code node iterates $input.all() \u2014 an n8n Code node in the default\n// \"Run Once for All Items\" mode that reads $json silently processes ONLY the first item,\n// which would drop bookings the moment a caller fans out.\nconst str = (v) => (typeof v === 'string' ? v.trim() : (v === null || v === undefined ? '' : String(v).trim()));\nconst nul = (v) => { const s = str(v); return s === '' ? null : s; };\n// Manila has no DST, so a bare local timestamp is exactly +08:00 \u2014 resolve it here and echo\n// the resolved instant back, rather than letting Postgres guess with the session TimeZone.\nconst MANILA = '+08:00';\nconst isoish = /^(\\d{4})-(\\d{2})-(\\d{2})[T ](\\d{2}):(\\d{2})(:\\d{2})?(\\.\\d+)?(Z|[+-]\\d{2}:?\\d{2}|[+-]\\d{2})?$/;\nfunction normaliseInstant(v) {\n  const s = str(v);\n  const m = isoish.exec(s);\n  if (!m) return null;\n  let base = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}${m[6] || ':00'}`;\n  let off = m[8];\n  if (!off) off = MANILA;                       // naked -> salon-local\n  else if (off !== 'Z') {\n    if (off.length === 3) off = off + ':00';     // +08   -> +08:00\n    else if (off.length === 5) off = off.slice(0, 3) + ':' + off.slice(3); // +0800 -> +08:00\n  }\n  const d = new Date(base + off);\n  return isNaN(d.getTime()) ? null : d.toISOString().replace(/\\.\\d{3}Z$/, 'Z');\n}\nfunction validDate(s) {\n  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return false;\n  const d = new Date(s + 'T00:00:00Z');\n  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  const service_id = nul(j.service_id);\n  const dateRaw = str(j.date);\n  const stylist_id = nul(j.stylist_id);\n  let invalid = null;\n  if (!service_id) invalid = 'invalid_input';\n  else if (!dateRaw) invalid = 'invalid_date';\n  else if (!validDate(dateRaw)) invalid = 'invalid_date';\n  out.push({ json: {\n    service_id,\n    date: invalid === 'invalid_date' ? null : dateRaw,\n    stylist_id,\n    invalid,\n  } });\n}\nif (out.length === 0) out.push({ json: { service_id: null, date: null, stylist_id: null, invalid: 'invalid_input' } });\nreturn out;\n"
+      },
+      "id": "validate",
+      "name": "Validate input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH p AS (\n  SELECT $1::text AS service_id, $2::date AS on_date, $3::text AS stylist_id\n),\nsvc AS (\n  SELECT s.* FROM service s JOIN p ON s.id = p.service_id WHERE s.active\n),\ncand AS (\n  SELECT st.id, st.name, st.rating, bh.opens_at, bh.closes_at\n  FROM p\n  JOIN stylist_service ss ON ss.service_id = p.service_id\n  JOIN stylist st         ON st.id = ss.stylist_id AND st.active\n  JOIN business_hours bh  ON bh.stylist_id = st.id\n                         AND bh.weekday = EXTRACT(DOW FROM p.on_date)::smallint\n  WHERE p.stylist_id IS NULL OR st.id = p.stylist_id\n),\ngrid AS (\n  SELECT c.id AS stylist_id, c.name AS stylist_name,\n         g AS starts_at, g + make_interval(mins => svc.duration_min) AS ends_at\n  FROM cand c CROSS JOIN p CROSS JOIN svc\n  CROSS JOIN LATERAL generate_series(\n      ((p.on_date + c.opens_at)  AT TIME ZONE 'Asia/Manila'),\n      ((p.on_date + c.closes_at) AT TIME ZONE 'Asia/Manila') - make_interval(mins => svc.duration_min),\n      make_interval(mins => svc.duration_min)) AS g\n),\nopen_slots AS (\n  SELECT gr.* FROM grid gr\n  WHERE gr.starts_at > now()\n    AND NOT EXISTS (SELECT 1 FROM appointment a\n                    WHERE a.stylist_id = gr.stylist_id AND a.status = 'confirmed'\n                      AND tstzrange(a.starts_at, a.ends_at) && tstzrange(gr.starts_at, gr.ends_at))\n)\nSELECT json_build_object(\n  'service_ok',         (SELECT count(*) FROM svc) > 0,\n  'stylist_ok',         ($3::text IS NULL OR EXISTS (SELECT 1 FROM stylist WHERE id = $3::text AND active)),\n  'stylist_performs',   ($3::text IS NULL OR EXISTS (SELECT 1 FROM stylist_service WHERE stylist_id = $3::text AND service_id = $1::text)),\n  'service',            (SELECT json_build_object('id',id,'name',name,'duration_min',duration_min,'price_php',price_php) FROM svc),\n  'qualified_stylists', (SELECT count(DISTINCT id) FROM cand),\n  'date',               $2::text,\n  'slots', COALESCE((SELECT json_agg(json_build_object(\n      'stylist_id', os.stylist_id, 'stylist_name', os.stylist_name,\n      'starts_at_utc',   to_char(os.starts_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),\n      'ends_at_utc',     to_char(os.ends_at   AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),\n      'starts_at_local', to_char(os.starts_at AT TIME ZONE 'Asia/Manila','YYYY-MM-DD HH24:MI'),\n      'ends_at_local',   to_char(os.ends_at   AT TIME ZONE 'Asia/Manila','HH24:MI')\n    ) ORDER BY os.starts_at, os.stylist_id) FROM open_slots os), '[]'::json)\n) AS result;",
+        "options": {
+          "queryReplacement": "={{ [$json.service_id, $json.date, $json.stylist_id] }}"
+        }
+      },
+      "id": "query",
+      "name": "Query",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "sPRRlnWxeFGhEZbe",
+          "name": "Salon Booking Postgres (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map the single query row onto the closed response contract:\n//   exactly {ok:true, data} or {ok:false, reason} \u2014 never both, never a bare throw.\n// `reason` is a CLOSED ENUM. Raw driver text is never echoed: it can carry the connection\n// string and password, and the agent downstream would read it straight out to a customer.\nconst inputs = $input.all();\nconst checked = $('Validate input').all();\nconst out = [];\nfunction dbReason(errText) {\n  const e = String(errText || '');\n  if (e.includes('appointment_no_double_booking')) return 'slot_taken';\n  if (e.includes('statement timeout') || e.includes('canceling statement')) return 'timeout';\n  return 'db_unavailable';\n}\n\nfor (let i = 0; i < inputs.length; i++) {\n  const v = (checked[i] || checked[0] || {}).json || {};\n  const row = (inputs[i] || {}).json || {};\n  if (v.invalid) { out.push({ json: { ok: false, reason: v.invalid } }); continue; }\n  if (row.error !== undefined || !row.result) {\n    out.push({ json: { ok: false, reason: dbReason(row.error) } }); continue;\n  }\n  const d = row.result;\n  if (!d.service_ok)       { out.push({ json: { ok: false, reason: 'service_not_found' } }); continue; }\n  if (!d.stylist_ok)       { out.push({ json: { ok: false, reason: 'stylist_not_found' } }); continue; }\n  if (!d.stylist_performs) { out.push({ json: { ok: false, reason: 'stylist_does_not_perform_service' } }); continue; }\n  out.push({ json: { ok: true, data: {\n    service: d.service,\n    date: d.date,\n    timezone: 'Asia/Manila',\n    qualified_stylists: d.qualified_stylists,   // 0 = nobody performs this service that day\n    slots: d.slots,\n  } } });\n}\n\n// alwaysOutputData + this guard: the caller ALWAYS receives an item, even when the trigger\n// fired with nothing at all.\nif (out.length === 0) out.push({ json: { ok: false, reason: 'invalid_input' } });\nreturn out;\n"
+      },
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "content": "## 20 \u00b7 find availability\\n\\n**In** `{service_id, date:\"YYYY-MM-DD\" (salon-local), stylist_id?}`\\n**Out** `{ok:true, data:{service, date, timezone, qualified_stylists, slots[]}}`\\n\\nSlots are stepped by the service duration inside that stylist's hours for that weekday, exclude anything overlapping a confirmed appointment, and never sit in the past.\\n\\n`reason`: `invalid_input` \u00b7 `invalid_date` \u00b7 `service_not_found` \u00b7 `stylist_not_found` \u00b7 `stylist_does_not_perform_service` \u00b7 `db_unavailable` \u00b7 `timeout`",
+        "height": 300,
+        "width": 900,
+        "color": 4
+      },
+      "id": "note-835557",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -340
+      ]
+    }
+  ],
+  "connections": {
+    "When called by the agent": {
+      "main": [
+        [
+          {
+            "node": "Validate input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate input": {
+      "main": [
+        [
+          {
+            "node": "Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {}
+}
