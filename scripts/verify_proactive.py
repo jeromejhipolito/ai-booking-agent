@@ -13,6 +13,7 @@ Exit code is the number of failures (0 = all green).
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import sys
@@ -23,6 +24,13 @@ import verify_tools as vt
 import verify_chat as vc
 
 HARNESS = "http://localhost:5678/webhook/salon-tool"
+
+# The harness refuses to answer without this header — it can invoke create/cancel/reassign with
+# caller-supplied arguments, so it fails closed rather than trusting that nobody found the port.
+# Set the same value in n8n's environment and here: HARNESS_TOKEN=... python3 scripts/<this>.py
+HARNESS_TOKEN = os.environ.get("HARNESS_TOKEN", "")
+HEADERS = {"Content-Type": "application/json", "X-Harness-Token": HARNESS_TOKEN}
+
 VERBOSE = "-v" in sys.argv
 check = vt.check
 psql = vt.psql
@@ -31,7 +39,7 @@ psql = vt.psql
 def tool(name: str, payload: dict | None = None):
     body = {"tool": name, "input": payload or {}}
     req = urllib.request.Request(HARNESS, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers=HEADERS)
     with urllib.request.urlopen(req, timeout=180) as r:
         res = json.loads(r.read().decode())
     if VERBOSE:
@@ -56,7 +64,7 @@ def say(user_key: str, text: str) -> str:
     consent questions to the real customer's profile, not to a test-prefixed one."""
     body = {"tool": "chat", "input": {"user_key": user_key, "chat_id": 1, "text": text}}
     req = urllib.request.Request(HARNESS, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers=HEADERS)
     with urllib.request.urlopen(req, timeout=180) as r:
         res = json.loads(r.read().decode())
     reply = (res[0] or {}).get("reply", "") if res else ""
@@ -71,10 +79,26 @@ def notices(ref: str) -> list[str]:
     return [r for r in rows.splitlines() if r]
 
 
+# Everything this suite may destroy, named once. An appointment is ours if it is a fixture
+# (P<phase>-<n>), a demo-seed row (SEED-nnn), or a chat booking these scripts made; a person is
+# ours if they are a demo client or a chat-* user this script invented.
+OURS_APPT = ("a.ref LIKE 'P%-%' OR a.ref LIKE 'SEED-%' OR a.ref LIKE 'SHOT-%' "
+             "OR a.booking_key LIKE 'telegram:chat-%' OR a.booking_key LIKE 'wl:%'")
+OURS_CLIENT = "c.channel_user_id LIKE 'chat-%' OR c.channel_user_id LIKE 'demo-%'"
+
+
 def reset():
-    """Only what these scripts own. Chat users, their bookings, waitlist rows, the log."""
-    psql("DELETE FROM notification_log")
-    psql("DELETE FROM waitlist_entry")
+    """Only what these scripts own.
+
+    Every statement here is scoped. An unscoped `DELETE FROM notification_log` would wipe a real
+    salon's send-exactly-once ledger — so every past reminder goes out again on the next sweep —
+    and the demo guard never inspected that table, so a database holding the demo seed alongside
+    real traffic would have sailed straight through it.
+    """
+    psql(f"DELETE FROM notification_log n USING appointment a "
+         f"WHERE a.id = n.appointment_id AND ({OURS_APPT})")
+    psql(f"DELETE FROM waitlist_entry w USING client c "
+         f"WHERE c.id = w.client_id AND ({OURS_CLIENT})")
     psql("DELETE FROM appointment WHERE source = 'chat' "
          "AND (booking_key LIKE 'telegram:chat-%' OR booking_key LIKE 'wl:%')")
     # Every fixture this suite makes, not just one phase's prefix — a leftover from an
@@ -84,7 +108,8 @@ def reset():
     psql("DELETE FROM appointment WHERE ref LIKE 'P%-%'")
     psql("DELETE FROM bot_user_profile WHERE user_key LIKE 'telegram:chat-%'")
     psql("DELETE FROM n8n_chat_histories WHERE session_id LIKE 'telegram:%'")
-    psql("UPDATE bot_user_profile SET pending_booking=NULL, pending_set_at=NULL")
+    psql("UPDATE bot_user_profile SET pending_booking=NULL, pending_set_at=NULL "
+         "WHERE user_key LIKE 'telegram:chat-%' OR user_key LIKE 'telegram:demo-%'")
     psql("DELETE FROM client WHERE channel_user_id LIKE 'chat-%'")
 
 
@@ -201,7 +226,8 @@ def main() -> int:
 
     print("\nthe offer is only worth anything if it can actually be booked")
     psql("UPDATE waitlist_entry SET status='waiting', offer_expires_at=NULL, offered_appointment_id=NULL")
-    psql("UPDATE bot_user_profile SET pending_booking=NULL, pending_set_at=NULL")
+    psql("UPDATE bot_user_profile SET pending_booking=NULL, pending_set_at=NULL "
+         "WHERE user_key LIKE 'telegram:chat-%' OR user_key LIKE 'telegram:demo-%'")
     psql("DELETE FROM waitlist_entry w USING client c WHERE c.id=w.client_id AND c.id='cli_demo_ana'")
     backfill()
     before = psql("select count(*) from appointment where status='confirmed'")
@@ -340,7 +366,9 @@ def main() -> int:
     print("\nreviews · asked once, classified by the rating, routed to a human")
 
     def fresh_client(chat="demo-ana"):
-        reset(); psql("DELETE FROM review")
+        reset()
+        psql(f"DELETE FROM review r USING appointment a "
+             f"WHERE a.id = r.appointment_id AND ({OURS_APPT})")
         psql(f"""INSERT INTO bot_user_profile (user_key, channel) VALUES ('telegram:{chat}','telegram')
                  ON CONFLICT (user_key) DO UPDATE SET pending_booking=NULL, pending_set_at=NULL""")
 

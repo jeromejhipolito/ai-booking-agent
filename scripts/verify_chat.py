@@ -31,6 +31,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import verify_tools as vt          # psql(), guard_is_demo_database(), check()
 
 HARNESS = "http://localhost:5678/webhook/salon-tool"
+
+# The harness refuses to answer without this header — it can invoke create/cancel/reassign with
+# caller-supplied arguments, so it fails closed rather than trusting that nobody found the port.
+# Set the same value in n8n's environment and here: HARNESS_TOKEN=... python3 scripts/<this>.py
+HARNESS_TOKEN = os.environ.get("HARNESS_TOKEN", "")
+HEADERS = {"Content-Type": "application/json", "X-Harness-Token": HARNESS_TOKEN}
+
 VERBOSE = "-v" in sys.argv
 TEST_PREFIX = "telegram:chat-"
 
@@ -72,7 +79,7 @@ def say(user: str, text: str) -> str:
     for attempt in range(4):
         time.sleep(PACE if attempt == 0 else 20 * attempt)
         req = urllib.request.Request(HARNESS, data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
+                                     headers=HEADERS)
         with urllib.request.urlopen(req, timeout=120) as r:
             res = json.loads(r.read().decode())
         reply = (res[0] or {}).get("reply", "") if res else ""
@@ -95,6 +102,12 @@ def reset_chat():
 def appts(user: str) -> int:
     return int(vt.psql(f"select count(*) from appointment a join client c on c.id=a.client_id "
                        f"where c.channel_user_id = 'chat-{user}' and a.status='confirmed'"))
+
+
+def pending_date(user: str) -> str:
+    """The date the SERVER now holds for this conversation, whatever prose came back."""
+    return vt.psql(f"select coalesce(pending_booking ->> 'date', '') from bot_user_profile "
+                   f"where user_key = 'telegram:chat-{user}'")
 
 
 def has_ref(reply: str) -> str | None:
@@ -221,8 +234,14 @@ def main() -> int:
     say(u3, "Mia Lopez"); r = say(u3, "09170000002")
     check("read-back reached before the change", tue in r and "16:30" in r, r[:160])
     r = say(u3, f"actually make it {wed}")
+    # Assert what the SERVER now holds, not the wording. When the new date's 16:30 happens to be
+    # taken by an earlier case in this same run, a correct agent says "that time isn't free" and
+    # offers alternatives — a reply that never repeats the date. The contract is that nothing was
+    # booked and the pending row moved to the new day; string-matching the prose made a correct
+    # answer look like a failure roughly one run in three.
     check("AC-10 changing the date after the read-back produces a NEW read-back, not a booking",
-          appts(u3) == 0 and wed in r, r[:200])
+          appts(u3) == 0 and pending_date(u3) == wed,
+          f"pending={pending_date(u3)!r} reply={r[:160]}")
     r = say(u3, "yes")
     check("AC-10 the following yes books the CHANGED date",
           appts(u3) == 1 and vt.psql(f"select count(*) from appointment a join client c on c.id=a.client_id "

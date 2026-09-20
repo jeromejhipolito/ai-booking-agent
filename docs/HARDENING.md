@@ -222,9 +222,9 @@ reminder that mattered is the one permanently suppressed.
 |---|---|---|
 | Offer lifetime | 30 minutes, matching the pending read-back's own expiry | Two different clocks on the same promise is how a customer gets told they hold a slot the database has already given away. |
 | Minimum lead for a backfill offer | 60 minutes | Below that the offer expires after the appointment starts. |
-| `mode` on every Execute Workflow call | `once` (all items in one execution) | n8n deprecates per-item mode; every sub-workflow here is multi-item safe instead, which is the same guarantee without the deprecation. |
+| `mode` on every Execute Workflow call | `once` (all items in one execution) | n8n deprecates per-item mode. Every **tool** sub-workflow is multi-item safe instead (it iterates `$input.all()` and pairs back by index). The **agent core is deliberately single-turn** — a conversation is one turn by definition — so the Telegram adapter loops with a Split-In-Batches node and hands it one message at a time. Feeding it N messages at once would have answered the first and silently dropped the rest, after their Telegram offset was already consumed. |
 | An undeliverable notice | left unclaimed and retried | Marking it sent is worse than leaving it pending: the retry costs nothing, the suppression is permanent. |
-| A manager alert with no manager chat configured | still recorded (`manager-desk`) | It is the salon's audit trail; it should not depend on a bot being wired up. |
+| A manager alert with no manager chat configured | still recorded (`manager-desk`), and **not** sent | It is the salon's audit trail; it should not depend on a bot being wired up. The recipient defaults from `MANAGER_TELEGRAM_CHAT_ID`; when that is unset the placeholder is recognised as "nowhere to send" rather than POSTed — a placeholder chat id 400s, releases the claim, and re-sends every sweep forever. |
 | Rescheduling an appointment | **not supported** — reminders are keyed to the appointment, not to a version of it | Moving `starts_at` after a reminder fired would need the notice reset too. Out of scope here; documented rather than half-built. |
 
 ## Affected-area blast radius

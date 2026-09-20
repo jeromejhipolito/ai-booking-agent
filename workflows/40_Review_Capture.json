@@ -1,5 +1,5 @@
 {
-  "name": "40 \u00b7 ask for a review",
+  "name": "40 · ask for a review",
   "nodes": [
     {
       "parameters": {
@@ -87,7 +87,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Who to ask for a review: their own completed appointment, finished recently enough that\n-- they remember it, not already asked, not already reviewed, and reachable.\n--\n-- The ask is written as a pending row \u2014 the same mechanism a booking read-back uses \u2014 but ONLY\n-- when nothing else is already waiting on their answer. A review request that overwrites an\n-- outstanding booking confirmation would turn their \"yes\" into the wrong thing entirely.\nWITH cand AS (\n  SELECT a.id, a.ref, a.client_id, sv.name AS service_name, st.name AS stylist_name,\n         c.name AS client_name, c.channel || ':' || c.channel_user_id AS user_key,\n         to_char(a.starts_at AT TIME ZONE 'Asia/Manila', 'Dy DD Mon') AS when_local\n  FROM appointment a\n  JOIN service sv ON sv.id = a.service_id\n  JOIN stylist st ON st.id = a.stylist_id\n  JOIN client  c  ON c.id  = a.client_id\n  JOIN bot_user_profile b ON b.user_key = c.channel || ':' || c.channel_user_id\n  WHERE a.status = 'completed'\n    AND a.ends_at > now() - interval '7 days'          -- nobody remembers a haircut from March\n    -- Salon hours only. An appointment that ended at 20:00 gets asked the next morning, not\n    -- at three in the morning because that is when the scheduler happened to come round.\n    AND EXTRACT(HOUR FROM (now() AT TIME ZONE 'Asia/Manila')) BETWEEN 9 AND 19\n    AND COALESCE(btrim(c.channel_user_id), '') <> ''\n    AND (b.pending_booking IS NULL OR b.pending_set_at < now() - interval '30 minutes')\n    AND NOT EXISTS (SELECT 1 FROM review r WHERE r.appointment_id = a.id)\n    AND NOT EXISTS (SELECT 1 FROM notification_log n\n                    WHERE n.appointment_id = a.id AND n.recipient = 'client'\n                      AND n.recipient_ref = a.client_id AND n.kind = 'review_request')\n  ORDER BY a.ends_at DESC\n), asked AS (\n  UPDATE bot_user_profile b\n     SET pending_booking = json_build_object('kind', 'review', 'ref', cand.ref,\n           'appointment_id', cand.id, 'service_name', cand.service_name,\n           'stylist_name', cand.stylist_name,\n           'summary', 'review ' || cand.ref)::jsonb,\n         pending_set_at = now(), updated_at = now()\n    FROM cand WHERE b.user_key = cand.user_key\n  RETURNING b.user_key, cand.id\n)\nSELECT cand.id AS appointment_id, 'client' AS recipient, 'review_request' AS kind,\n       format('Hi %s \u2014 how was your %s with %s on %s? A rating out of 5 and a line about it would really help. '\n              || 'Reply here whenever you have a moment.',\n              cand.client_name, cand.service_name, cand.stylist_name, cand.when_local) AS text\nFROM asked JOIN cand ON cand.id = asked.id;",
+        "query": "-- Who to ask for a review: their own completed appointment, finished recently enough that\n-- they remember it, not already asked, not already reviewed, and reachable.\n--\n-- The ask is written as a pending row — the same mechanism a booking read-back uses — but ONLY\n-- when nothing else is already waiting on their answer. A review request that overwrites an\n-- outstanding booking confirmation would turn their \"yes\" into the wrong thing entirely.\nWITH cand AS (\n  SELECT a.id, a.ref, a.client_id, sv.name AS service_name, st.name AS stylist_name,\n         c.name AS client_name, c.channel || ':' || c.channel_user_id AS user_key,\n         to_char(a.starts_at AT TIME ZONE 'Asia/Manila', 'Dy DD Mon') AS when_local\n  FROM appointment a\n  JOIN service sv ON sv.id = a.service_id\n  JOIN stylist st ON st.id = a.stylist_id\n  JOIN client  c  ON c.id  = a.client_id\n  JOIN bot_user_profile b ON b.user_key = c.channel || ':' || c.channel_user_id\n  WHERE a.status = 'completed'\n    AND a.ends_at > now() - interval '7 days'          -- nobody remembers a haircut from March\n    -- Salon hours only. An appointment that ended at 20:00 gets asked the next morning, not\n    -- at three in the morning because that is when the scheduler happened to come round.\n    AND EXTRACT(HOUR FROM (now() AT TIME ZONE 'Asia/Manila')) BETWEEN 9 AND 19\n    AND COALESCE(btrim(c.channel_user_id), '') <> ''\n    AND (b.pending_booking IS NULL OR b.pending_set_at < now() - interval '30 minutes')\n    AND NOT EXISTS (SELECT 1 FROM review r WHERE r.appointment_id = a.id)\n    AND NOT EXISTS (SELECT 1 FROM notification_log n\n                    WHERE n.appointment_id = a.id AND n.recipient = 'client'\n                      AND n.recipient_ref = a.client_id AND n.kind = 'review_request')\n  ORDER BY a.ends_at DESC\n), asked AS (\n  UPDATE bot_user_profile b\n     SET pending_booking = json_build_object('kind', 'review', 'ref', cand.ref,\n           'appointment_id', cand.id, 'service_name', cand.service_name,\n           'stylist_name', cand.stylist_name,\n           'summary', 'review ' || cand.ref)::jsonb,\n         pending_set_at = now(), updated_at = now()\n    FROM cand WHERE b.user_key = cand.user_key\n  RETURNING b.user_key, cand.id\n)\nSELECT cand.id AS appointment_id, 'client' AS recipient, 'review_request' AS kind,\n       format('Hi %s — how was your %s with %s on %s? A rating out of 5 and a line about it would really help. '\n              || 'Reply here whenever you have a moment.',\n              cand.client_name, cand.service_name, cand.stylist_name, cand.when_local) AS text\nFROM asked JOIN cand ON cand.id = asked.id;",
         "options": {
           "queryReplacement": "={{ [] }}"
         }
@@ -127,7 +127,7 @@
         "source": "database",
         "workflowId": {
           "__rl": true,
-          "value": "6EOMx2mTG4SiFTzs",
+          "value": "@@WF:39 · send a notice (exactly once)@@",
           "mode": "id"
         },
         "options": {}
@@ -145,21 +145,21 @@
     },
     {
       "parameters": {
-        "jsCode": "const sent = $input.all().map(i => i.json || {});\nconst completed = (($('Mark finished appointments complete').first().json || {}).result || {}).completed;\nconst by = sent.reduce((a, s) => { const k = s.reason || 'unknown'; a[k] = (a[k] || 0) + 1; return a; }, {});\nreturn [{ json: { ran_at: new Date().toISOString(), marked_completed: completed,\n                  review_requests: sent.length, by_outcome: by } }];\n"
+        "jsCode": "// The disarm node replaces the item with its own result, so read the send outcomes\n// from the node that produced them.\nconst sent = $('Send the request').all().map(i => i.json || {});\nconst completed = (($('Mark finished appointments complete').first().json || {}).result || {}).completed;\nconst by = sent.reduce((a, s) => { const k = s.reason || 'unknown'; a[k] = (a[k] || 0) + 1; return a; }, {});\nreturn [{ json: { ran_at: new Date().toISOString(), marked_completed: completed,\n                  review_requests: sent.length, by_outcome: by } }];\n"
       },
       "id": "sum",
       "name": "Run summary",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1390,
+        1540,
         0
       ],
       "alwaysOutputData": true
     },
     {
       "parameters": {
-        "content": "## 40 \u00b7 ask for a review\\n\\nMarks appointments complete 30 minutes after they end \u2014 asking how the cut went while someone is still in the chair is worse than not asking \u2014 then asks that customer, once, guarded by `notification_log`.\\n\\nThe ask is written as a pending row, the same mechanism a booking read-back uses, and **only when nothing else is waiting on their answer**: a review request that overwrote an outstanding booking confirmation would turn their \"yes\" into the wrong thing entirely.\\n\\nNobody is chased about a haircut from three months ago, and nobody is asked twice.",
+        "content": "## 40 · ask for a review\\n\\nMarks appointments complete 30 minutes after they end — asking how the cut went while someone is still in the chair is worse than not asking — then asks that customer, once, guarded by `notification_log`.\\n\\nThe ask is written as a pending row, the same mechanism a booking read-back uses, and **only when nothing else is waiting on their answer**: a review request that overwrote an outstanding booking confirmation would turn their \"yes\" into the wrong thing entirely.\\n\\nNobody is chased about a haircut from three months ago, and nobody is asked twice.",
         "height": 320,
         "width": 860,
         "color": 4
@@ -172,6 +172,31 @@
         0,
         -380
       ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The review ask is written as a pending row BEFORE the sender runs, so a notice that never\n-- reached the customer would still leave them \"under review\": the next thing they happened to\n-- say would be filed as feedback about a haircut nobody asked them about. If the send genuinely\n-- failed, take the ask back. 'no_transport' is not a failure — there is simply no Telegram bot\n-- wired up, and the conversation still works through whatever channel is.\nWITH f AS (SELECT $1::bigint AS appt_id)\nUPDATE bot_user_profile b\n   SET pending_booking = NULL, pending_set_at = NULL, updated_at = now()\n  FROM f\n WHERE f.appt_id IS NOT NULL\n   AND b.pending_booking ->> 'kind' = 'review'\n   AND (b.pending_booking ->> 'appointment_id')::bigint = f.appt_id\nRETURNING b.user_key;",
+        "options": {
+          "queryReplacement": "={{ [ ($json.sent === false && ['send_failed','no_recipient','db_unavailable','appointment_not_found'].indexOf($json.reason) >= 0) ? ((($json.echo || {}).appointment_id) || null) : null ] }}"
+        }
+      },
+      "id": "disarm",
+      "name": "Take back asks that never went",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1320,
+        0
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "postgres": {
+          "id": "sPRRlnWxeFGhEZbe",
+          "name": "Salon Booking Postgres (local)"
+        }
+      }
     }
   ],
   "connections": {
@@ -234,7 +259,7 @@
       "main": [
         [
           {
-            "node": "Run summary",
+            "node": "Take back asks that never went",
             "type": "main",
             "index": 0
           }
@@ -246,6 +271,17 @@
         [
           {
             "node": "Mark finished appointments complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Take back asks that never went": {
+      "main": [
+        [
+          {
+            "node": "Run summary",
             "type": "main",
             "index": 0
           }

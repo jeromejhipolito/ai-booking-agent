@@ -42,6 +42,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      ollama:
+        condition: service_started
     environment:
       - DB_TYPE=postgresdb
       - DB_POSTGRESDB_HOST=postgres
@@ -63,6 +65,8 @@ services:
       - TZ=${TZ}
       - N8N_RUNNERS_ENABLED=true
       - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      # n8n and ollama are separate containers: 127.0.0.1 inside n8n is n8n, not ollama.
+      - OLLAMA_URL=http://ollama:11434
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - MANAGER_TELEGRAM_CHAT_ID=${MANAGER_TELEGRAM_CHAT_ID}
     volumes:

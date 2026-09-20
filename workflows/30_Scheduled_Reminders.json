@@ -77,7 +77,7 @@
         "source": "database",
         "workflowId": {
           "__rl": true,
-          "value": "6EOMx2mTG4SiFTzs",
+          "value": "@@WF:39 · send a notice (exactly once)@@",
           "mode": "id"
         },
         "options": {}

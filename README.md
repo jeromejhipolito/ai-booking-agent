@@ -187,7 +187,8 @@ npx n8n start
 # 5. import the workflows (Settings → n8n API → create a key)
 N8N_API_KEY=... python3 scripts/import_workflows.py --activate
 
-# 6. prove it
+# 6. prove it — the harness fails closed, so give it a token and turn it on by hand
+export HARNESS_TOKEN=any-long-random-string   # the same value must be in n8n's environment
 python3 scripts/verify_tools.py      # the booking tools
 python3 scripts/verify_chat.py       # the whole conversation
 python3 scripts/verify_proactive.py  # reminders, backfill, stylist declines
@@ -197,11 +198,15 @@ Five things that will bite you:
 
 - **Sub-workflows must be active.** An Execute Workflow call to an inactive workflow fails with
   *"Workflow is not active and cannot be executed"* — hence `--activate`.
+- **Workflow ids are per-instance, so the JSON does not contain any.** Wherever one workflow calls
+  another the committed file says `@@WF:<workflow name>@@`; `import_workflows.py` creates every
+  workflow first, then resolves those names to the ids *your* n8n minted. Names are stable and
+  readable in a diff — a committed id is only ever right on the machine that exported it.
 - **Credential ids are per-instance.** The JSON carries the ids from the machine it was exported
   from. After importing elsewhere, open each Postgres and Groq node once and pick your own.
-- **Ollama's URL differs by install.** Native n8n reaches it at `http://127.0.0.1:11434`; inside
-  compose it is `http://ollama:11434`. It is set on the *Embed incoming* node and on the Ollama
-  credential.
+- **Ollama's URL differs by install.** `OLLAMA_URL` sets it, defaulting to `http://127.0.0.1:11434`
+  for a native n8n; the compose file sets `http://ollama:11434`, because inside the n8n container
+  `127.0.0.1` is n8n itself. The Ollama *credential* on the chat-model node is separate — set both.
 - **The chat model is a swap.** `Chat Model (Ollama, local)` is enabled; `Chat Model (Groq)` and
   `Chat Model (OpenRouter)` sit disabled beside it on the canvas. Enable one, disable the other —
   nothing else changes, and `verify_chat.py` will tell you what the swap bought or cost. Both
@@ -212,8 +217,11 @@ Five things that will bite you:
   workflows polling one token means every customer gets two replies.
 
 For a real deployment use `deploy/docker-compose.yml` (Postgres + Ollama + n8n + Caddy with
-automatic HTTPS) and **deactivate `90 · dev: tool test harness`** — it is an unauthenticated trigger
-meant only for local verification.
+automatic HTTPS). **`90 · dev: tool test harness` is never activated by the importer** and refuses
+every request unless `HARNESS_TOKEN` is set *and* the caller sends it as `X-Harness-Token` — it can
+invoke create, cancel, reassign and submit-review with caller-supplied arguments, and booking
+references come from a sequence, so they are trivially guessable. Leave `HARNESS_TOKEN` unset in
+production and the endpoint answers nobody.
 
 ## Verification
 
@@ -260,6 +268,12 @@ mid-call.
 - **Rescheduling an existing appointment is not supported.** Reminders are keyed to the
   appointment, so moving its start time after a reminder fired would need the notice reset too.
   Cancel and rebook works today; a proper reschedule is a feature, not a patch.
+- **The service matcher is keyed to the seeded catalogue.** `Parse extraction` carries alias,
+  phrase and root tables against the six `svc_*` ids in `deploy/seed-demo-salon.sql`. Add a service
+  to the `service` table and the deterministic matcher will not know its nicknames until those
+  tables learn it — the live catalogue is what gets priced and booked, but the *matching* is not yet
+  derived from it. Flagged rather than half-built: deriving it properly means a per-salon alias
+  table, not a longer literal.
 - **The retrieval threshold is a noise floor, not a decision.** Measured on this FAQ, in-scope and
   off-topic questions overlap (0.395–0.656 against 0.282–0.491), so the prompt decides whether the
   notes actually answer the question. See [docs/HARDENING.md](docs/HARDENING.md).

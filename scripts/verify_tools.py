@@ -13,6 +13,7 @@ Exit code is the number of failures (0 = all green).
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -22,6 +23,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 HARNESS = "http://localhost:5678/webhook/salon-tool"
+
+# The harness refuses to answer without this header — it can invoke create/cancel/reassign with
+# caller-supplied arguments, so it fails closed rather than trusting that nobody found the port.
+# Set the same value in n8n's environment and here: HARNESS_TOKEN=... python3 scripts/<this>.py
+HARNESS_TOKEN = os.environ.get("HARNESS_TOKEN", "")
+HEADERS = {"Content-Type": "application/json", "X-Harness-Token": HARNESS_TOKEN}
+
 CONTAINER = "booking-pg-local"
 DB = ["-U", "n8n", "-d", "salon_booking"]
 VERBOSE = "-v" in sys.argv
@@ -48,7 +56,7 @@ def call(tool: str, payload: dict | None = None, many: list[dict] | None = None)
     else:
         body["input"] = payload or {}
     req = urllib.request.Request(
-        HARNESS, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
+        HARNESS, data=json.dumps(body).encode(), headers=HEADERS
     )
     with urllib.request.urlopen(req, timeout=30) as r:
         res = json.loads(r.read().decode())
@@ -111,6 +119,25 @@ def guard_is_demo_database():
             f"refusing to run: {stray} chat booking(s) here were not created by this script. "
             "That looks like real data — point this at a throwaway database."
         )
+    # The reset also clears notification_log and waitlist_entry, so the guard has to look at
+    # them too — checking only `appointment` let a database with the demo seed AND a real send
+    # ledger pass, and the ledger is what stops every past reminder going out a second time.
+    for table, sql, what in (
+        ("notification_log",
+         "select count(*) from notification_log n join appointment a on a.id = n.appointment_id "
+         "where a.ref not like 'P%-%' and a.ref not like 'SEED-%' and a.ref not like 'SHOT-%' and a.source <> 'chat'",
+         "delivery records against appointments this script did not create"),
+        ("waitlist_entry",
+         "select count(*) from waitlist_entry w join client c on c.id = w.client_id "
+         "where c.channel_user_id not like 'chat-%' and c.channel_user_id not like 'demo-%'",
+         "waitlist entries belonging to people this script did not invent"),
+    ):
+        n = psql(sql)
+        if n != "0":
+            raise SystemExit(
+                f"refusing to run: {n} {what} in `{table}`. "
+                "That looks like real data — point this at a throwaway database."
+            )
 
 
 def reset():
