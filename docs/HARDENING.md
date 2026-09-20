@@ -155,7 +155,7 @@ behind a sharper one — which is the argument for testing with the weak one.
 
 Groq's `openai/gpt-oss-20b` is faster and noticeably sharper at the extraction. It is not the
 default for two reasons. First, both hosted free tiers meter **tokens** per minute, and a
-multi-turn suite of 38 assertions exceeds that within about a minute — measured, after pacing
+multi-turn suite of 40 assertions exceeds that within about a minute — measured, after pacing
 attempts from 1.5s up to 22s between messages, which only stretched the run to an hour without
 completing it. Second, and more to the point: everything that is allowed to be wrong here is the
 model, so the default should be the weakest plausible one. Swapping to a hosted model is two
@@ -232,7 +232,7 @@ reminder that mattered is the one permanently suppressed.
 Phase 1's tools are consumed unmodified. Phase 2's core gains three branches (waitlist acceptance,
 waitlist join, reassignment consent) and one reordering — an outstanding question the agent asked is
 now answered before any guess at the customer's intent. **Re-verified:** phase 1's 51 and phase 2's
-38 assertions both still pass unchanged.
+40 assertions both still pass unchanged.
 
 ---
 

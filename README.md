@@ -5,7 +5,7 @@ the agent works out what they want, checks the diary, reads the booking back, an
 when they say yes.
 
 > **Complete.** Schema, booking tools, conversational agent, proactive automation and review
-> capture — all built and verified end to end against a live stack, 135 live assertions.
+> capture — all built and verified end to end against a live stack, 139 live assertions.
 
 ```
 Customer: hi, i'd like a haircut
@@ -133,7 +133,7 @@ is the end of the message.
 | `workflows/40_Review_Capture.json` | Marks appointments complete and asks how it went, once. |
 | `workflows/41_tool_submit_review.json` | Stores the review, classifies it, routes praise and complaints to a human. |
 | `workflows/90_dev_test_harness.json` | Dev-only webhook that calls any tool — or the whole conversation — by name. |
-| `scripts/verify_tools.py` · `verify_chat.py` · `verify_proactive.py` | 51 + 38 + 46 live assertions against a running stack. |
+| `scripts/verify_tools.py` · `verify_chat.py` · `verify_proactive.py` | 51 + 40 + 48 live assertions against a running stack. |
 | `scripts/ingest_kb.py` · `scripts/import_workflows.py` | Embed the FAQ; push workflows into n8n. |
 
 ## The response contract (tools)
@@ -217,7 +217,7 @@ Five things that will bite you:
 - **The chat model is a swap.** `Chat Model (Ollama, local)` is enabled; `Chat Model (Groq)` and
   `Chat Model (OpenRouter)` sit disabled beside it on the canvas. Enable one, disable the other —
   nothing else changes, and `verify_chat.py` will tell you what the swap bought or cost. Both
-  hosted free tiers meter *tokens* per minute, which a 38-assertion multi-turn suite exceeds in
+  hosted free tiers meter *tokens* per minute, which a 40-assertion multi-turn suite exceeds in
   about a minute; that is why the default is the one with no meter.
 - **One poller per bot token.** `11_Booking_Telegram_Adapter` ships **inactive** and needs
   `TELEGRAM_BOT_TOKEN` in the environment plus a Telegram credential on its send node. Two active
@@ -238,8 +238,8 @@ data disagreeing is the exact failure this design exists to prevent.
 
 ```
 scripts/verify_tools.py      51 passed, 0 failed
-scripts/verify_chat.py       38 passed, 0 failed
-scripts/verify_proactive.py  46 passed, 0 failed
+scripts/verify_chat.py       40 passed, 0 failed
+scripts/verify_proactive.py  48 passed, 0 failed
 ```
 
 Both run against a **self-hosted 7B model** — deliberately. A design whose whole premise is

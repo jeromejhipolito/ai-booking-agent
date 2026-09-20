@@ -110,9 +110,9 @@ is byte-identical, which is asserted in `verify_tools.py`.
 | Suite | Assertions | Drives |
 |---|---|---|
 | `verify_tools.py` | 51 | the tools, through real n8n executions |
-| `verify_chat.py` | 38 | real conversations, asserted against the database |
-| `verify_proactive.py` | 46 | real scheduler sweeps, backfills, declines and reviews |
+| `verify_chat.py` | 40 | real conversations, asserted against the database |
+| `verify_proactive.py` | 48 | real scheduler sweeps, backfills, declines and reviews |
 
-135 in total, none of them mocked: each one fires a real workflow and then asks Postgres what
+139 in total, none of them mocked: each one fires a real workflow and then asks Postgres what
 actually happened, because the reply and the data disagreeing is the failure the whole design
 exists to prevent.
