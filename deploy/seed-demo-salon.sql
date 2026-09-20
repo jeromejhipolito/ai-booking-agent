@@ -11,13 +11,17 @@
 -- ---------------------------------------------------------------------------
 -- stylists
 -- ---------------------------------------------------------------------------
-INSERT INTO stylist (id, name, title, bio, rating) VALUES
-  ('sty_maria', 'Maria Santos',  'Senior Colourist', 'Twelve years in colour correction and balayage. Trained in Seoul.', 4.9),
-  ('sty_joy',   'Joy Ramirez',   'Senior Stylist',   'Precision cuts and keratin treatments. Teaches at the academy on Mondays.', 4.8),
-  ('sty_ruel',  'Ruel Bautista', 'Master Barber',    'Classic barbering, fades and beard work. Fifteen years on the chair.', 4.9),
-  ('sty_bea',   'Bea Cruz',      'Stylist',          'Blow-dry styling, hair spa and nail care. Fastest hands in the studio.', 4.7)
+-- telegram_chat_id is where a stylist's shift reminders go. These are demo values: with no
+-- TELEGRAM_BOT_TOKEN configured nothing is actually sent, but every notice is still recorded
+-- in notification_log, which is what the send-exactly-once guard is built on.
+INSERT INTO stylist (id, name, title, bio, rating, telegram_chat_id) VALUES
+  ('sty_maria', 'Maria Santos',  'Senior Colourist', 'Twelve years in colour correction and balayage. Trained in Seoul.', 4.9, 'demo-stylist-maria'),
+  ('sty_joy',   'Joy Ramirez',   'Senior Stylist',   'Precision cuts and keratin treatments. Teaches at the academy on Mondays.', 4.8, 'demo-stylist-joy'),
+  ('sty_ruel',  'Ruel Bautista', 'Master Barber',    'Classic barbering, fades and beard work. Fifteen years on the chair.', 4.9, 'demo-stylist-ruel'),
+  ('sty_bea',   'Bea Cruz',      'Stylist',          'Blow-dry styling, hair spa and nail care. Fastest hands in the studio.', 4.7, 'demo-stylist-bea')
 ON CONFLICT (id) DO UPDATE
-  SET name = EXCLUDED.name, title = EXCLUDED.title, bio = EXCLUDED.bio, rating = EXCLUDED.rating;
+  SET name = EXCLUDED.name, title = EXCLUDED.title, bio = EXCLUDED.bio, rating = EXCLUDED.rating,
+      telegram_chat_id = COALESCE(stylist.telegram_chat_id, EXCLUDED.telegram_chat_id);
 
 -- ---------------------------------------------------------------------------
 -- services

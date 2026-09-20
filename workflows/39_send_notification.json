@@ -1,0 +1,163 @@
+{
+  "name": "39 \u00b7 send a notice (exactly once)",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "t",
+      "name": "When called by a sender",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Claim the right to send, THEN send \u2014 and work out WHO it goes to here rather than\n-- trusting the caller: a chat id passed in could address the wrong customer entirely.\n-- The unique key includes recipient_ref, so a notice to a new stylist after a reassignment,\n-- or to the next person a waitlist offer rolls to, is not mistaken for a duplicate.\n-- Always returns exactly one row, so a fan-out of N items stays index-aligned.\nWITH req AS (\n  SELECT $1::bigint AS appointment_id, $2::text AS recipient, $3::text AS kind,\n         $4::text AS manager_chat, $5::bigint AS waitlist_entry_id\n), res AS (\n  -- A waitlist offer is about one appointment but addressed to a DIFFERENT customer: the one\n  -- waiting, not the one who cancelled. Naming the entry still keeps the lookup server-side \u2014\n  -- the caller never supplies a chat id.\n  SELECT a.id, a.status,\n         CASE r.recipient WHEN 'stylist' THEN a.stylist_id\n                          WHEN 'client'  THEN COALESCE(wc.id, a.client_id)\n                          ELSE 'manager' END AS recipient_ref,\n         CASE r.recipient WHEN 'stylist' THEN st.telegram_chat_id\n                          WHEN 'client'  THEN COALESCE(wc.channel_user_id, c.channel_user_id)\n                          -- A manager alert is the salon's audit trail and must be recorded\n                          -- even when no manager chat is configured to receive it.\n                          ELSE COALESCE(r.manager_chat, 'manager-desk') END AS chat_id\n  FROM req r\n  JOIN appointment a ON a.id = r.appointment_id\n  JOIN stylist st    ON st.id = a.stylist_id\n  JOIN client  c     ON c.id  = a.client_id\n  LEFT JOIN waitlist_entry w ON w.id = r.waitlist_entry_id\n  LEFT JOIN client wc        ON wc.id = w.client_id\n), ins AS (\n  INSERT INTO notification_log (appointment_id, recipient, recipient_ref, kind, channel, detail)\n  SELECT r.appointment_id, r.recipient, res.recipient_ref, r.kind, 'telegram', 'claimed'\n  FROM req r CROSS JOIN res\n  -- Never claim what cannot be delivered: an unreachable person would be marked \"sent\"\n  -- forever. Leaving it unclaimed means the next run tries again once they have a chat id.\n  WHERE res.chat_id IS NOT NULL AND btrim(res.chat_id) <> ''\n    -- A reminder for an appointment cancelled between the sweep and the send must not go\n    -- out. Notices ABOUT a cancellation obviously still may.\n    AND (r.kind NOT IN ('booked','reminder_24h','reminder_1h') OR res.status = 'confirmed')\n  ON CONFLICT (appointment_id, recipient, recipient_ref, kind) DO NOTHING\n  RETURNING id\n)\nSELECT json_build_object(\n  'found',         (SELECT count(*) FROM res) > 0,\n  'status',        (SELECT status FROM res),\n  'chat_id',       (SELECT chat_id FROM res),\n  'recipient_ref', (SELECT recipient_ref FROM res),\n  'claimed',       (SELECT count(*) FROM ins) > 0,\n  'log_id',        (SELECT id FROM ins)\n) AS result;",
+        "options": {
+          "queryReplacement": "={{ [$json.appointment_id, $json.recipient, $json.kind, $json.manager_chat || null, $json.waitlist_entry_id || null] }}"
+        }
+      },
+      "id": "claim",
+      "name": "Claim the notice",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        240,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "sPRRlnWxeFGhEZbe",
+          "name": "Salon Booking Postgres (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Deliver what was just claimed, for EVERY item. A Code node left in the default\n// \"Run Once for All Items\" mode that reads $json would deliver the first reminder and\n// silently drop the other eleven \u2014 the easiest way there is to break a fan-out.\nconst claims = $input.all();\nconst asked = $('When called by a sender').all();\n// n8n blocks $env in Code nodes unless N8N_BLOCK_ENV_ACCESS_IN_NODE=false (the deploy compose\n// sets it; a default local install does not). Read it defensively, so a blocked env means\n// \"no transport configured\" rather than a thrown node that strands every claim.\nlet token = '';\ntry { token = $env.TELEGRAM_BOT_TOKEN || ''; } catch (e) { token = ''; }\n\nconst out = [];\nfor (let i = 0; i < claims.length; i++) {\n  const req = (asked[i] || asked[0] || {}).json || {};\n  const row = (claims[i] || {}).json || {};\n  const res = row.result || {};\n  const echo = { appointment_id: req.appointment_id, recipient: req.recipient, kind: req.kind };\n  const fail = (reason, log_id, release, detail) =>\n    out.push({ json: { ok: false, sent: false, reason, log_id: log_id || null,\n                       release: release === true, detail: detail || null, echo } });\n\n  if (row.error !== undefined) { fail('db_unavailable'); continue; }\n  if (!res.found)              { fail('appointment_not_found'); continue; }\n  if (!res.chat_id)            { fail('no_recipient'); continue; }      // unclaimed: retry later\n  if (!res.claimed) {\n    const suppressed = ['booked', 'reminder_24h', 'reminder_1h'].indexOf(req.kind) >= 0\n                       && res.status !== 'confirmed';\n    // Not claimed because someone got there first, or because the appointment stopped being\n    // confirmed. The second is a suppression, not a duplicate \u2014 say which.\n    out.push({ json: { ok: true, sent: false, reason: suppressed ? 'not_confirmed' : 'already_sent',\n                       log_id: null, release: false, detail: null, echo } });\n    continue;\n  }\n  if (!token) {\n    // Claimed and recorded, but there is no bot to send through. The salon's audit trail does\n    // not depend on one being wired up.\n    out.push({ json: { ok: true, sent: false, reason: 'no_transport', log_id: res.log_id,\n                       release: false, detail: 'logged, no transport configured', echo } });\n    continue;\n  }\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST', url: `https://api.telegram.org/bot${token}/sendMessage`, json: true,\n      body: { chat_id: res.chat_id, text: String(req.text || '').slice(0, 3500) },\n    });\n    out.push({ json: { ok: true, sent: true, reason: 'delivered', log_id: res.log_id,\n                       release: false, detail: 'delivered', echo } });\n  } catch (e) {\n    fail('send_failed', res.log_id, true);      // give the claim back\n  }\n}\nif (out.length === 0) out.push({ json: { ok: false, sent: false, reason: 'invalid_input',\n                                         log_id: null, release: false, detail: null, echo: {} } });\nreturn out;\n"
+      },
+      "id": "deliver",
+      "name": "Deliver",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        470,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- A claim that could not be delivered must be given back, or the notice is marked sent\n-- forever and never arrives. Deleting it lets the next run try again.\nWITH del AS (\n  DELETE FROM notification_log WHERE id = $1::bigint AND $2::boolean = true RETURNING id\n), upd AS (\n  UPDATE notification_log SET detail = $3::text\n  WHERE id = $1::bigint AND $2::boolean = false AND $3::text IS NOT NULL RETURNING id\n)\nSELECT json_build_object('released', (SELECT count(*) FROM del) > 0) AS result;",
+        "options": {
+          "queryReplacement": "={{ [$json.log_id, $json.release, $json.detail] }}"
+        }
+      },
+      "id": "release",
+      "name": "Release or mark",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        700,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "sPRRlnWxeFGhEZbe",
+          "name": "Salon Booking Postgres (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = $('Deliver').all().map(s => {\n  const j = s.json || {};\n  return { json: { ok: j.ok === true, sent: j.sent === true, reason: j.reason,\n                   appointment_id: (j.echo || {}).appointment_id,\n                   recipient: (j.echo || {}).recipient, kind: (j.echo || {}).kind } };\n});\nif (out.length === 0) out.push({ json: { ok: false, sent: false, reason: 'invalid_input' } });\nreturn out;\n"
+      },
+      "id": "result",
+      "name": "Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        930,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "content": "## 39 \u00b7 send a notice, exactly once\\n\\n**In** `{appointment_id, recipient, kind, text}` \u2014 one item or many.\\n\\nClaims the right to send by INSERTing into `notification_log`, and only then sends. Two schedulers racing, or the same run twice, produce one winner and one silent no-op.\\n\\n**Who it goes to is worked out here**, from the appointment \u2014 never taken from the caller, because a chat id passed in could address the wrong customer.\\n\\nIt will not claim what it cannot deliver (nobody to send to), nor a reminder for an appointment that stopped being confirmed since the sweep picked it up. If the send then fails the claim is **given back**, because a claim that never arrived would otherwise mark the notice sent forever.",
+        "height": 320,
+        "width": 860,
+        "color": 4
+      },
+      "id": "n39",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -390
+      ]
+    }
+  ],
+  "connections": {
+    "When called by a sender": {
+      "main": [
+        [
+          {
+            "node": "Claim the notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim the notice": {
+      "main": [
+        [
+          {
+            "node": "Deliver",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deliver": {
+      "main": [
+        [
+          {
+            "node": "Release or mark",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Release or mark": {
+      "main": [
+        [
+          {
+            "node": "Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {}
+}

@@ -1,0 +1,189 @@
+{
+  "name": "30 \u00b7 scheduled reminders",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "sched",
+      "name": "Every 15 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "manual",
+      "name": "Run the sweep now",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Every notice DUE and not already logged, one row each. The sender is the real\n-- exactly-once guard; this NOT EXISTS only keeps the fan-out small.\n--\n-- A timed reminder is only due if the booking existed before its window opened: book something\n-- for this afternoon and you get a confirmation, not a \"reminder\" three seconds later telling\n-- you what you just did.\n--\n-- Rows with nobody to send to are left out rather than claimed \u2014 an undeliverable notice\n-- marked sent is worse than one still pending.\nWITH live AS (\n  SELECT a.id, a.ref, a.starts_at, a.created_at, a.status, a.stylist_id, a.client_id,\n         sv.name AS service_name, sv.duration_min,\n         st.name AS stylist_name, st.telegram_chat_id AS stylist_chat,\n         c.name  AS client_name,  c.channel_user_id  AS client_chat,\n         to_char(a.starts_at AT TIME ZONE 'Asia/Manila', 'Dy DD Mon, HH24:MI') AS when_local,\n         a.starts_at - now() AS lead\n  FROM appointment a\n  JOIN service sv ON sv.id = a.service_id\n  JOIN stylist st ON st.id = a.stylist_id\n  JOIN client  c  ON c.id  = a.client_id\n  WHERE a.starts_at > now()\n), kinds(recipient, kind, needs_status, lead_within, min_notice) AS (\n  VALUES ('stylist','booked',       'confirmed', NULL::interval,      NULL::interval),\n         ('stylist','reminder_24h', 'confirmed', interval '24 hours', interval '24 hours'),\n         ('stylist','reminder_1h',  'confirmed', interval '1 hour',   interval '1 hour'),\n         ('client', 'reminder_24h', 'confirmed', interval '24 hours', interval '24 hours'),\n         -- A stylist whose diary just lost an appointment needs telling as much as one that\n         -- gained one. Without this the chair is quietly empty and nobody knows.\n         ('stylist','cancelled',    'cancelled', NULL,                NULL)\n)\nSELECT d.id AS appointment_id, k.recipient, k.kind,\n       CASE\n         WHEN k.kind = 'booked' THEN\n           format('New booking: %s with %s, %s (%s min). Ref %s.',\n                  d.service_name, d.client_name, d.when_local, d.duration_min, d.ref)\n         WHEN k.kind = 'cancelled' THEN\n           format('Cancelled: %s with %s, %s is no longer going ahead. Ref %s.',\n                  d.service_name, d.client_name, d.when_local, d.ref)\n         WHEN k.recipient = 'stylist' THEN\n           format('Reminder: %s with %s, %s. Ref %s.',\n                  d.service_name, d.client_name, d.when_local, d.ref)\n         ELSE\n           format('Hi %s - a reminder that your %s with %s is %s. Reply here if you need to move it. Ref %s.',\n                  d.client_name, d.service_name, d.stylist_name, d.when_local, d.ref)\n       END AS text\nFROM live d\nCROSS JOIN kinds k\nWHERE d.status = k.needs_status\n  AND (k.lead_within IS NULL OR d.lead <= k.lead_within)\n  AND (k.min_notice IS NULL OR d.created_at <= d.starts_at - k.min_notice)\n  AND COALESCE(btrim(CASE k.recipient WHEN 'stylist' THEN d.stylist_chat ELSE d.client_chat END), '') <> ''\n  AND NOT EXISTS (\n        SELECT 1 FROM notification_log n\n        WHERE n.appointment_id = d.id AND n.recipient = k.recipient AND n.kind = k.kind\n          AND n.recipient_ref = CASE k.recipient WHEN 'stylist' THEN d.stylist_id ELSE d.client_id END)\nORDER BY d.starts_at, k.recipient, k.kind;",
+        "options": {
+          "queryReplacement": "={{ [] }}"
+        }
+      },
+      "id": "due",
+      "name": "Notices due now",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        240,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "sPRRlnWxeFGhEZbe",
+          "name": "Salon Booking Postgres (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Most runs have nothing to do. A Postgres node with alwaysOutputData emits one EMPTY item\n// for zero rows, which would reach the sender as a malformed notice \u2014 drop it here. This node\n// must NOT set alwaysOutputData, or an empty return becomes an empty item all over again.\nreturn $input.all().filter(i => (i.json || {}).appointment_id !== undefined);\n"
+      },
+      "id": "gate",
+      "name": "Anything to send?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        470,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "6EOMx2mTG4SiFTzs",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "send",
+      "name": "Send each notice",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        700,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// One line per notice handled, so a scheduler run is auditable at a glance.\nconst sent = $input.all().map(i => i.json || {});\nconst by = sent.reduce((a, s) => { const k = s.reason || 'unknown'; a[k] = (a[k] || 0) + 1; return a; }, {});\nreturn [{ json: { ran_at: new Date().toISOString(), notices: sent.length, by_outcome: by,\n                  detail: sent.map(s => `${s.recipient}/${s.kind}#${s.appointment_id}:${s.reason}`) } }];\n"
+      },
+      "id": "sum",
+      "name": "Run summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        930,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "content": "## 30 \u00b7 reminders\\n\\nEvery 15 minutes, one question: which notices are **due and not already logged**?\\n\\n* stylist \u2014 `booked` as soon as an appointment exists, then `reminder_24h`, `reminder_1h`, and `cancelled` if it falls through\\n* client \u2014 `reminder_24h`\\n\\nA timed reminder is only due if the booking existed before its window opened, so a same-day booking gets a confirmation rather than a \"reminder\" about what you just did. Nobody with no chat id is offered one: an undeliverable notice marked sent is worse than one still pending.\\n\\nThe whole fan-out goes to `39` in ONE call carrying every due item \u2014 `39` is multi-item safe, and n8n's per-item mode is deprecated. Exactly-once is `39`'s claim, not this query: two sweeps overlapping still produce one notice each.",
+        "height": 320,
+        "width": 860,
+        "color": 4
+      },
+      "id": "n30",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -390
+      ]
+    }
+  ],
+  "connections": {
+    "Every 15 minutes": {
+      "main": [
+        [
+          {
+            "node": "Notices due now",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notices due now": {
+      "main": [
+        [
+          {
+            "node": "Anything to send?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything to send?": {
+      "main": [
+        [
+          {
+            "node": "Send each notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send each notice": {
+      "main": [
+        [
+          {
+            "node": "Run summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run the sweep now": {
+      "main": [
+        [
+          {
+            "node": "Notices due now",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {}
+}

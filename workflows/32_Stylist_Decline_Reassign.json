@@ -1,0 +1,277 @@
+{
+  "name": "32 \u00b7 stylist decline \u2192 client consent",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "t",
+      "name": "When a stylist declines",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- What the decline is about, and whether it is still a live question. Always one row.\nWITH p AS (SELECT $1::text AS ref, $2::text AS stylist_id)\nSELECT json_build_object(\n  'found',       EXISTS (SELECT 1 FROM appointment a, p WHERE a.ref = p.ref),\n  'status',      (SELECT a.status FROM appointment a, p WHERE a.ref = p.ref),\n  'in_future',   COALESCE((SELECT a.starts_at FROM appointment a, p WHERE a.ref = p.ref) > now(), false),\n  'still_theirs',COALESCE((SELECT a.stylist_id FROM appointment a, p WHERE a.ref = p.ref)\n                          = (SELECT stylist_id FROM p), false),\n  -- A stylist tapping decline twice must not send the customer two consent requests.\n  'already_asked', EXISTS (\n      SELECT 1 FROM appointment a, bot_user_profile b, client c\n      WHERE a.ref = (SELECT ref FROM p) AND c.id = a.client_id\n        AND b.user_key = c.channel || ':' || c.channel_user_id\n        AND b.pending_booking ->> 'kind' = 'reassign'\n        AND b.pending_set_at > now() - interval '30 minutes'),\n  -- `p` is a scalar subquery here, not a comma-join: mixing a comma-join with JOIN puts the\n  -- comma-joined table out of scope inside the ON clauses and Postgres rejects the whole query.\n  'appointment', (SELECT json_build_object(\n      'id', a.id, 'ref', a.ref, 'service_id', a.service_id, 'service_name', sv.name,\n      'stylist_id', a.stylist_id, 'stylist_name', st.name,\n      'client_id', a.client_id, 'client_name', c.name,\n      'user_key', c.channel || ':' || c.channel_user_id,\n      'starts_at_utc', to_char(a.starts_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),\n      'ends_at_utc',   to_char(a.ends_at   AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),\n      'starts_at_local', to_char(a.starts_at AT TIME ZONE 'Asia/Manila','Dy DD Mon, HH24:MI'))\n    FROM appointment a\n    JOIN service sv ON sv.id = a.service_id\n    JOIN stylist st ON st.id = a.stylist_id\n    JOIN client  c  ON c.id  = a.client_id\n    WHERE a.ref = (SELECT ref FROM p))\n) AS result;",
+        "options": {
+          "queryReplacement": "={{ [$json.booking_ref, $json.stylist_id] }}"
+        }
+      },
+      "id": "look",
+      "name": "Look up the appointment",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        230,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "sPRRlnWxeFGhEZbe",
+          "name": "Salon Booking Postgres (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Shape the alternatives call, and decide up front whether this decline is even answerable.\nconst row = ($input.first().json || {});\nconst d = row.result || {};\nconst a = d.appointment || {};\nconst bad = row.error !== undefined ? 'db_unavailable'\n  : !d.found ? 'booking_not_found'\n  : d.status !== 'confirmed' ? 'not_confirmed'\n  : !d.in_future ? 'already_started'\n  : !d.still_theirs ? 'already_reassigned'\n  : d.already_asked ? 'consent_already_pending'\n  : null;\nreturn [{ json: {\n  // 23's arguments at the top level; everything else travels under _ctx.\n  service_id: a.service_id || null, starts_at: a.starts_at_utc || null,\n  ends_at: a.ends_at_utc || null, exclude_stylist_id: a.stylist_id || null,\n  _ctx: { bad, appt: a },\n} }];\n"
+      },
+      "id": "args",
+      "name": "Build the alternatives request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "KC8NpsjweuihtSJN",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "alts",
+      "name": "Find who else is free",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        690,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Choose the replacement to PROPOSE \u2014 and propose it, never apply it. The customer decides\n// who touches their hair; a salon that silently swaps the person is a salon you leave.\nconst alts = ($input.first().json || {});\nconst ctx = ($('Build the alternatives request').first().json || {})._ctx || {};\nconst a = ctx.appt || {};\n// Even a dead end emits ONE item, so the branch reaches the result node instead of ending\n// silently and leaving the caller with nothing at all.\nif (ctx.bad) {\n  return [{ json: { _result: { ok: false, reason: ctx.bad }, _skip: true } }];\n}\nconst list = (alts.ok && alts.data && alts.data.alternatives) ? alts.data.alternatives : [];\nconst pick = list[0] || null;\n// Every notice becomes an item for the sender, and the verdict rides on the first of them.\nfunction notify(result, pending, notices) {\n  return notices.map((n, i) => ({ json: Object.assign({}, n,\n    i === 0 ? { _result: result, _pending: pending } : {}) }));\n}\n\nif (!pick) {\n  // Nobody free. Say so plainly, offer the two things that are actually possible, and put it\n  // in front of a human \u2014 never invent a name to fill the gap.\n  return notify({ ok: true, outcome: 'no_alternative', ref: a.ref }, null, [\n      { appointment_id: a.id, recipient: 'client', kind: 'reassign_none',\n        text: `About your ${a.service_name} on ${a.starts_at_local}: ${a.stylist_name} can no longer make it, `\n            + `and nobody else is free at that time. Would you like to move it to another slot, or cancel? `\n            + `Reply here and we will sort it out.` },\n      { appointment_id: a.id, recipient: 'manager', kind: 'reassign_none_manager',\n        text: `No cover for ${a.ref}: ${a.service_name}, ${a.starts_at_local}, ${a.stylist_name} declined `\n            + `and no alternative stylist is free. Client ${a.client_name} has been asked to reschedule or cancel.` },\n  ]);\n}\nreturn notify({ ok: true, outcome: 'consent_requested', ref: a.ref, proposed: pick.stylist_name },\n  { user_key: a.user_key, json: JSON.stringify({\n      kind: 'reassign', ref: a.ref, appointment_id: a.id,\n      from_stylist_id: a.stylist_id, from_stylist_name: a.stylist_name,\n      to_stylist_id: pick.stylist_id, to_stylist_name: pick.stylist_name,\n      service_name: a.service_name, starts_at_local: a.starts_at_local,\n      summary: `move ${a.ref} to ${pick.stylist_name}` }) },\n  [\n    { appointment_id: a.id, recipient: 'client', kind: 'reassign_consent',\n      text: `Hi ${a.client_name} \u2014 ${a.stylist_name} can't make your ${a.service_name} on ${a.starts_at_local}. `\n          + `${pick.stylist_name}${pick.title ? ', our ' + pick.title.toLowerCase() + ',' : ''} is free at the same time `\n          + `and is held to exactly the same standard as the rest of our team. `\n          + `Shall I move you to ${pick.stylist_name}? Reply yes, or no if you would rather keep `\n          + `${a.stylist_name} and find another time.` },\n  ]);\n"
+      },
+      "id": "decide",
+      "name": "Decide the replacement",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Write the consent question as a server-side pending row \u2014 the same mechanism a booking\n-- read-back uses. The customer's \"yes\" later confirms THIS, not whatever a model extracted.\n-- A live conversation is never talked over.\nWITH p AS (SELECT $1::text AS user_key, $2::jsonb AS pending)\nUPDATE bot_user_profile b\n   SET pending_booking = p.pending, pending_set_at = now(), updated_at = now()\n  FROM p\n WHERE b.user_key = p.user_key AND p.pending IS NOT NULL\n   AND (b.pending_booking IS NULL OR b.pending_set_at < now() - interval '30 minutes')\nRETURNING b.user_key;",
+        "options": {
+          "queryReplacement": "={{ [($json._pending || {}).user_key || null, ($json._pending || {}).json || null] }}"
+        }
+      },
+      "id": "pend",
+      "name": "Write the consent question",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1150,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "sPRRlnWxeFGhEZbe",
+          "name": "Salon Booking Postgres (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "6EOMx2mTG4SiFTzs",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "send",
+      "name": "Tell the client (and the manager)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1610,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// A Postgres node REPLACES the item with its own result, so the notices written by \"Decide\"\n// are gone by the time we reach the sender. Recover them from the node that produced them \u2014\n// the standard way to carry fields across a node that rewrites the item.\nreturn $('Decide the replacement').all();\n"
+      },
+      "id": "recover",
+      "name": "Notices to send",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Decide the replacement').first().json || {};\nlet sends = [];\ntry { sends = $('Tell the client (and the manager)').all().map(s => s.json || {}); } catch (e) { sends = []; }\nreturn [{ json: Object.assign({}, d._result || { ok: false, reason: 'unknown' },\n                              { notices: sends.map(s => `${s.recipient}/${s.kind}:${s.reason}`) }) }];\n"
+      },
+      "id": "res",
+      "name": "Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1840,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "content": "## 32 \u00b7 a stylist cannot make it\\n\\n**In** `{booking_ref, stylist_id}` \u2014 the stylist who is declining.\\n\\nIt finds who else is free and then **asks the customer**, naming the replacement and saying plainly that they are held to the same standard. It never reassigns silently: the customer decides who touches their hair.\\n\\nThe question is written as a pending row on the customer's profile \u2014 the same mechanism a booking read-back uses \u2014 so their \"yes\" is confirmed against what they were actually shown. Tool `24` then re-checks everything at the moment of the move; if the replacement got busy in the meantime, nothing changes and the customer is told.\\n\\nNobody free? The customer is offered a reschedule or a cancellation, and a human is told. No name is invented to fill the gap.",
+        "height": 320,
+        "width": 860,
+        "color": 4
+      },
+      "id": "n32",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -400
+      ]
+    }
+  ],
+  "connections": {
+    "When a stylist declines": {
+      "main": [
+        [
+          {
+            "node": "Look up the appointment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Look up the appointment": {
+      "main": [
+        [
+          {
+            "node": "Build the alternatives request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build the alternatives request": {
+      "main": [
+        [
+          {
+            "node": "Find who else is free",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find who else is free": {
+      "main": [
+        [
+          {
+            "node": "Decide the replacement",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide the replacement": {
+      "main": [
+        [
+          {
+            "node": "Write the consent question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write the consent question": {
+      "main": [
+        [
+          {
+            "node": "Notices to send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notices to send": {
+      "main": [
+        [
+          {
+            "node": "Tell the client (and the manager)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tell the client (and the manager)": {
+      "main": [
+        [
+          {
+            "node": "Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {}
+}

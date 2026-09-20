@@ -160,3 +160,76 @@ attempts from 1.5s up to 22s between messages, which only stretched the run to a
 completing it. Second, and more to the point: everything that is allowed to be wrong here is the
 model, so the default should be the weakest plausible one. Swapping to a hosted model is two
 clicks and can only improve the numbers.
+
+---
+
+# Hardening notes — phase 3/4 (proactive automation)
+
+Same method: self-derived AC, the 9 gap-classes, a `qa-engineer` adversarial matrix (83 cases)
+triaged into must-builds, logged decisions and later-phase work.
+
+## Self-derived AC
+
+| AC | Given / When / Then |
+|---|---|
+| AC-1 | A stylist notice fires exactly once per (appointment, person, kind), even across two consecutive sweeps — and only when it makes sense to send it. |
+| AC-2 | Cancelling a booked slot with two waitlisted customers leaves exactly one of them holding it, with no overlapping rows. |
+| AC-3 | A stylist declining asks the customer's permission before anything changes. |
+| AC-4 | The customer's "yes" reassigns; "no" keeps the original stylist and puts it in front of a human. |
+| AC-5 | An offer nobody answers rolls to the next person, and never loops back. |
+
+## Two schema defects the matrix found before they shipped
+
+**The send-once key was keyed on a role, not a person.** `UNIQUE (appointment_id, recipient, kind)`
+looks right until an appointment is reassigned: the new stylist's `booked` notice is indistinguishable
+from the old stylist's, so it is suppressed and **the stylist is never told they have a client**. The
+same key breaks the waitlist queue — when an offer expires and rolls on, the second customer's offer
+looks like a duplicate of the first's and is silently dropped, so AC-5 passes on paper and stalls in
+practice. `notification_log.recipient_ref` and a four-column key fix both and keep the first
+recipient's audit trail.
+
+**A claim that was never delivered marked the notice sent forever.** Claim-then-send is right — it is
+what makes exactly-once work — but only if a failed send **gives the claim back**. Otherwise the one
+reminder that mattered is the one permanently suppressed.
+
+## Hardened items (all ENG, all built)
+
+| # | Class | Requirement | Matrix case |
+|---|---|---|---|
+| P-A | data contract | The send-once key includes WHO the notice was for, so a reassignment or a rolled offer is not mistaken for a duplicate. | 30, 31, 36, 37 |
+| P-B | state | A failed send releases its claim; a claim is never taken for something undeliverable (nobody to send to) in the first place. | 22, 23, 24, 25 |
+| P-C | permission | `39` derives the recipient from the appointment (or the named waitlist entry) — never from a `chat_id` the caller passed, which could address the wrong customer. | 29 |
+| P-D | state/lifecycle | A reminder for an appointment cancelled between the sweep and the send is suppressed at claim time, not sent. | 5, 6, 34 |
+| P-E | boundary | A timed reminder is only due if the booking existed before its window opened — a booking made for this afternoon gets a confirmation, not a "reminder" about what you just did. | 9, 10, 11, 12 |
+| P-F | negative | A stylist is told when an appointment is cancelled, not only when one is made. | 33 |
+| P-G | concurrency | The backfill claims the customer's read-back FIRST and the queue place second, so a slot is never held for half an hour for someone who was never told. | 52, 54 |
+| P-H | concurrency | One live offer per freed window, and one outstanding offer per customer — a customer has one pending row, so two offers would be ambiguous. | 45, 46, 60 |
+| P-I | idempotency | An entry remembers which appointment it was offered, so an expired offer rolls forward instead of looping back to the same person. | 48 |
+| P-J | integration | A freed slot is only offered to someone whose service that stylist performs, who is reachable, who is not already busy in that window, and who did not cancel it themselves. | 38, 39, 54, 59 |
+| P-K | boundary | Nothing is offered on a window under an hour away, or already in the past — a 30-minute window to accept a slot starting in eight minutes is not an offer. | 57, 58 |
+| P-L | state | Accepting an offer runs the ORDINARY booking path, so the EXCLUDE constraint decides who gets it; losing the race puts the entry back in the queue rather than consuming it. | 40, 43, 47 |
+| P-M | permission | A reassignment is authorised by a server-side consent row and the customer's literal yes — the same mechanism a booking read-back uses. | 75, 76 |
+| P-N | state/lifecycle | `24` re-checks at the moment of the move: still confirmed, still in the future, still held by the stylist who declined, and the replacement still performs the service, works those hours and is free. | 61, 62, 68, 70 |
+| P-O | idempotency | A stylist declining twice asks the customer once. | 63 |
+| P-P | negative | With nobody free, the customer is offered a reschedule or a cancellation and a human is told — no name is invented to fill the gap. | 66, 67 |
+| P-Q | boundary | A waitlist joined from chat is bounded to the day asked about; an open-ended window would match every slot that ever frees. | 79 |
+| P-R | ambiguous term | Nobody is added to a waitlist without saying yes, and saying yes twice for the same day adds one entry. | 77, 78 |
+| P-S | integration | A read-back written by a BACKGROUND job is honoured on the customer's "yes" even though it is not in the model's conversation window — authorisation lives in the database, not in the transcript. | 52 |
+
+## Decisions taken (logged, not asked)
+
+| Decision | Chosen default | Why |
+|---|---|---|
+| Offer lifetime | 30 minutes, matching the pending read-back's own expiry | Two different clocks on the same promise is how a customer gets told they hold a slot the database has already given away. |
+| Minimum lead for a backfill offer | 60 minutes | Below that the offer expires after the appointment starts. |
+| `mode` on every Execute Workflow call | `once` (all items in one execution) | n8n deprecates per-item mode; every sub-workflow here is multi-item safe instead, which is the same guarantee without the deprecation. |
+| An undeliverable notice | left unclaimed and retried | Marking it sent is worse than leaving it pending: the retry costs nothing, the suppression is permanent. |
+| A manager alert with no manager chat configured | still recorded (`manager-desk`) | It is the salon's audit trail; it should not depend on a bot being wired up. |
+| Rescheduling an appointment | **not supported** — reminders are keyed to the appointment, not to a version of it | Moving `starts_at` after a reminder fired would need the notice reset too. Out of scope here; documented rather than half-built. |
+
+## Affected-area blast radius
+
+Phase 1's tools are consumed unmodified. Phase 2's core gains three branches (waitlist acceptance,
+waitlist join, reassignment consent) and one reordering — an outstanding question the agent asked is
+now answered before any guess at the customer's intent. **Re-verified:** phase 1's 51 and phase 2's
+38 assertions both still pass unchanged.

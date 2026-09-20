@@ -4,10 +4,10 @@ An n8n automation where the **conversation is the booking system**. A client mes
 the agent works out what they want, checks the diary, reads the booking back, and takes it only
 when they say yes.
 
-> **Status: phases 1–2 of 4 complete.** The schema, the four booking tools and the conversational
-> agent are built and verified end to end against a live stack. Proactive automation — reminders,
-> filling cancellations from a waitlist, a stylist who can't make a shift — is phase 3; reviews
-> routed to the manager is phase 4.
+> **Status: phases 1–3 of 4 complete.** The schema, the booking tools, the conversational agent and
+> the proactive automation — reminders, filling cancellations from a waitlist, a stylist who can't
+> make a shift — are built and verified end to end against a live stack. Reviews routed to the
+> manager is phase 4.
 
 ```
 Customer: hi, i'd like a haircut
@@ -80,6 +80,31 @@ data-not-instructions rule is restated **after** them where a small model actual
 anything the model writes is scrubbed of booking references and confirmation wording before it
 reaches a customer.
 
+## The part that isn't a chatbot
+
+A booking system that only answers when spoken to is a form with extra steps. Three things run on
+their own:
+
+**Reminders.** Every fifteen minutes the sweep asks which notices are due and not already logged —
+the stylist when a booking lands, both of them a day before, the stylist an hour before, and the
+stylist again if it falls through. Exactly-once is a database claim, not a flag: a notice is
+INSERTed under a unique key *before* it is sent, so two sweeps overlapping produce one message. If
+the send then fails the claim is given back, because a claim that never arrived would otherwise
+mark the notice sent forever.
+
+**Filling a cancellation.** A slot falls through and the person who has been waiting longest is
+offered it — as a **pending read-back**, exactly what the agent writes when it reads a booking back
+to you. Their "yes" runs the ordinary booking path and the EXCLUDE constraint decides who actually
+gets it. No special acceptance route, no second way to create an appointment. An offer expires after
+thirty minutes and rolls to the next person, and because the entry remembers which slot it was
+offered, it never loops back to someone who already passed.
+
+**A stylist who can't make it.** The agent finds who else is free and then **asks you**, naming the
+replacement and saying plainly that they are held to the same standard. It never reassigns silently:
+you decide who touches your hair. Say no and you keep your stylist, with a reschedule or a
+cancellation offered and a human told. Say yes and the move is re-checked at that moment — if the
+replacement got busy while you were deciding, nothing changes and you are told.
+
 ## What's built
 
 | File | What it is |
@@ -91,8 +116,13 @@ reaches a customer.
 | `workflows/10_Booking_Agent_Core.json` | The conversation: profile → embed → retrieve → one model call → deterministic routing → rendered reply. |
 | `workflows/11_Booking_Telegram_Adapter.json` | Transport only. Polls `getUpdates`, calls the core, sends the reply. |
 | `workflows/20…23_tool_*.json` | The four deterministic booking tools. Trigger → validate → one parameterised query → shape the response. |
+| `workflows/24_tool_reassign_booking.json` | Move a booking to another stylist, re-checking everything at the moment of the move. |
+| `workflows/30_Scheduled_Reminders.json` | Which notices are due, every 15 minutes. |
+| `workflows/31_Cancellation_Backfill.json` | A freed slot goes to whoever has been waiting longest. |
+| `workflows/32_Stylist_Decline_Reassign.json` | A stylist can't make it — ask the customer first. |
+| `workflows/39_send_notification.json` | Claim, then send. The exactly-once guard everything else leans on. |
 | `workflows/90_dev_test_harness.json` | Dev-only webhook that calls any tool — or the whole conversation — by name. |
-| `scripts/verify_tools.py` · `scripts/verify_chat.py` | 51 + 38 live assertions against a running stack. |
+| `scripts/verify_tools.py` · `verify_chat.py` · `verify_proactive.py` | 51 + 38 + 34 live assertions against a running stack. |
 | `scripts/ingest_kb.py` · `scripts/import_workflows.py` | Embed the FAQ; push workflows into n8n. |
 
 ## The response contract (tools)
@@ -144,8 +174,9 @@ npx n8n start
 N8N_API_KEY=... python3 scripts/import_workflows.py --activate
 
 # 6. prove it
-python3 scripts/verify_tools.py      # the four tools
+python3 scripts/verify_tools.py      # the booking tools
 python3 scripts/verify_chat.py       # the whole conversation
+python3 scripts/verify_proactive.py  # reminders, backfill, stylist declines
 ```
 
 Five things that will bite you:
@@ -177,8 +208,9 @@ walk sends actual messages and then asks the *database* what happened, because t
 data disagreeing is the exact failure this design exists to prevent.
 
 ```
-scripts/verify_tools.py   51 passed, 0 failed
-scripts/verify_chat.py    38 passed, 0 failed
+scripts/verify_tools.py      51 passed, 0 failed
+scripts/verify_chat.py       38 passed, 0 failed
+scripts/verify_proactive.py  34 passed, 0 failed
 ```
 
 Both run against a **self-hosted 7B model** — deliberately. A design whose whole premise is
@@ -211,6 +243,9 @@ mid-call.
   the customer's own words, Filipino roots included (`magpagupit` → haircut), a bare name or
   number in reply to a question is claimed regardless of what the model labelled it, and
   agreement is tokenised so "Opo, sige" confirms while "yes, but make it 3pm" does not.
+- **Rescheduling an existing appointment is not supported.** Reminders are keyed to the
+  appointment, so moving its start time after a reminder fired would need the notice reset too.
+  Cancel and rebook works today; a proper reschedule is a feature, not a patch.
 - **The retrieval threshold is a noise floor, not a decision.** Measured on this FAQ, in-scope and
   off-topic questions overlap (0.395–0.656 against 0.282–0.491), so the prompt decides whether the
   notes actually answer the question. See [docs/HARDENING.md](docs/HARDENING.md).

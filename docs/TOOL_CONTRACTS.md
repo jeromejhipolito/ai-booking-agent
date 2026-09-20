@@ -215,3 +215,72 @@ rendered from a tool's JSON result, so a price or a confirmation can only come f
 The 20-turn model window lives separately, in n8n's own `n8n_chat_histories` table. Clearing a
 customer's memory means truncating **both** — wiping the profile alone leaves the model still
 remembering the old thread.
+
+---
+
+# Phase 3 — the proactive workflows
+
+## 24 · tool: reassign booking
+
+```jsonc
+// in
+{ "booking_ref": "BK-00042", "from_stylist_id": "sty_maria", "to_stylist_id": "sty_joy" }
+```
+```jsonc
+// out
+{ "ok": true, "data": { "ref": "BK-00042", "stylist_id": "sty_joy", "stylist_name": "Joy Ramirez",
+                        "service_name": "Haircut", "starts_at_local": "2026-09-23 13:20" } }
+```
+
+The same closed contract as tools 20–23. It re-checks everything at the moment of the move rather
+than trusting the moment of the offer: still confirmed, still in the future, still held by the
+stylist who declined, and the replacement performs the service, works those hours and is free. The
+EXCLUDE constraint remains the final judge.
+
+`reason`: `invalid_input` · `booking_not_found` · `not_confirmed` · `already_started` ·
+`already_reassigned` · `stylist_not_found` · `stylist_does_not_perform_service` ·
+`outside_business_hours` · `replacement_busy` · `not_moved` · `db_unavailable`
+
+## 39 · send a notice (exactly once)
+
+```jsonc
+// in — one item, or many
+{ "appointment_id": 288, "recipient": "stylist|client|manager", "kind": "reminder_24h",
+  "text": "…", "waitlist_entry_id": 12 }        // entry only for a waitlist offer
+```
+```jsonc
+// out
+{ "ok": true, "sent": false, "reason": "no_transport",
+  "appointment_id": 288, "recipient": "stylist", "kind": "reminder_24h" }
+```
+
+**Who it goes to is derived here**, from the appointment (or the named waitlist entry) — never from
+a chat id the caller supplies, because that could address the wrong customer.
+
+It claims the right to send by INSERTing into `notification_log` under
+`UNIQUE (appointment_id, recipient, recipient_ref, kind)` and only then sends. It will not claim
+what it cannot deliver, nor a reminder for an appointment that stopped being confirmed since the
+sweep picked it up; and if the send fails, the claim is given back.
+
+`reason`: `delivered` · `already_sent` · `not_confirmed` · `no_recipient` · `no_transport` ·
+`appointment_not_found` · `send_failed` · `db_unavailable`
+
+## 30 · scheduled reminders · 31 · cancellation backfill · 32 · stylist decline
+
+Schedule-triggered (30 and 31 also carry an Execute Workflow Trigger so a sweep can be run on
+demand). `32` takes `{booking_ref, stylist_id}` — the stylist who is declining.
+
+| Kind written to `notification_log` | To | When |
+|---|---|---|
+| `booked` | stylist | as soon as a confirmed appointment exists |
+| `reminder_24h` | stylist, client | 24h out, if the booking existed before that window opened |
+| `reminder_1h` | stylist | 1h out, same condition |
+| `cancelled` | stylist | the appointment fell through |
+| `offer` | waitlisted client | a freed slot is theirs for 30 minutes |
+| `reassign_consent` | client | their stylist cannot make it; here is who can |
+| `reassign_none` / `reassign_none_manager` | client, manager | nobody can cover it |
+| `reassign_unresolved` | manager | the customer refused the replacement, or the move failed |
+
+A waitlist offer and a consent request are both written as the customer's **pending read-back** —
+the same row a booking read-back uses — so their "yes" runs the ordinary path and the database
+decides the outcome. There is no second way to create or move an appointment.
