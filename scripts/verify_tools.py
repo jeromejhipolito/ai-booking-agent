@@ -144,7 +144,10 @@ def reset():
     """Back to the seeded state: drop what earlier runs booked, re-apply the seed."""
     psql("DELETE FROM appointment WHERE source = 'chat' AND ("
          + " or ".join(f"booking_key like '{k}%'" for k in OWNED_KEYS) + ")")
-    psql("DELETE FROM client WHERE id LIKE 'cli_%' AND id NOT LIKE 'cli_demo_%'")
+    # Scoped by the marker this suite actually stamps, like the other two scripts. Keyed on the
+    # id prefix it deleted any `cli_*` row — including people created by a real integration that
+    # happen to have no chat-source appointment, or aborting the run mid-reset on an FK violation.
+    psql("DELETE FROM client WHERE channel_user_id LIKE 'chat-%'")
     seed = subprocess.run(
         ["docker", "exec", "-i", CONTAINER, "psql", *DB, "-q", "-v", "ON_ERROR_STOP=1"],
         # Resolved against the repo, not the shell's cwd — the script must work from anywhere.

@@ -76,8 +76,8 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        920,
-        0
+        1120,
+        -120
       ]
     },
     {
@@ -95,22 +95,22 @@
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1.2,
       "position": [
-        1150,
-        0
+        1350,
+        -120
       ],
       "onError": "continueRegularOutput",
       "alwaysOutputData": true
     },
     {
       "parameters": {
-        "jsCode": "// The verdict is what the caller gets back; whether the manager's copy went out is an\n// operational detail that must never change what the customer is told.\nreturn $('Respond').all().map(i => {\n  const j = i.json || {};\n  return { json: j.ok ? { ok: true, data: j.data } : { ok: false, reason: j.reason } };\n});\n"
+        "jsCode": "// The verdict is what the caller gets back; whether the manager's copy went out is an\n// operational detail that must never change what the customer is told — which is why this\n// hangs off Respond directly rather than off the end of the manager branch. Chained behind\n// it, a review warranting no notice produced no items, so this node never ran and the\n// sub-workflow returned nothing: a stored review reported to the customer as a failure,\n// and every error reason (already_reviewed, not_completed) silently unreachable.\nreturn $('Respond').all().map(i => {\n  const j = i.json || {};\n  return { json: j.ok ? { ok: true, data: j.data } : { ok: false, reason: j.reason } };\n});\n"
       },
       "id": "final",
       "name": "Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1380,
+        1560,
         0
       ],
       "alwaysOutputData": true
@@ -129,6 +129,37 @@
       "position": [
         0,
         -360
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-notice",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              },
+              "leftValue": "={{ $json._notice ? 'y' : '' }}",
+              "rightValue": ""
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "needcopy",
+      "name": "Manager copy needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        900,
+        0
       ]
     }
   ],
@@ -170,7 +201,7 @@
       "main": [
         [
           {
-            "node": "Manager copy",
+            "node": "Manager copy needed?",
             "type": "main",
             "index": 0
           }
@@ -182,6 +213,24 @@
         [
           {
             "node": "Tell the manager",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manager copy needed?": {
+      "main": [
+        [
+          {
+            "node": "Manager copy",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Result",
             "type": "main",
             "index": 0
           }

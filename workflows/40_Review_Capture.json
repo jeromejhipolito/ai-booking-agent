@@ -178,7 +178,7 @@
         "operation": "executeQuery",
         "query": "-- The review ask is written as a pending row BEFORE the sender runs, so a notice that never\n-- reached the customer would still leave them \"under review\": the next thing they happened to\n-- say would be filed as feedback about a haircut nobody asked them about. If the send genuinely\n-- failed, take the ask back. 'no_transport' is not a failure — there is simply no Telegram bot\n-- wired up, and the conversation still works through whatever channel is.\nWITH f AS (SELECT $1::bigint AS appt_id)\nUPDATE bot_user_profile b\n   SET pending_booking = NULL, pending_set_at = NULL, updated_at = now()\n  FROM f\n WHERE f.appt_id IS NOT NULL\n   AND b.pending_booking ->> 'kind' = 'review'\n   AND (b.pending_booking ->> 'appointment_id')::bigint = f.appt_id\nRETURNING b.user_key;",
         "options": {
-          "queryReplacement": "={{ [ ($json.sent === false && ['send_failed','no_recipient','db_unavailable','appointment_not_found'].indexOf($json.reason) >= 0) ? ((($json.echo || {}).appointment_id) || null) : null ] }}"
+          "queryReplacement": "={{ [ ($json.sent === false && ['send_failed','no_recipient','db_unavailable','appointment_not_found'].indexOf($json.reason) >= 0) ? ($json.appointment_id || null) : null ] }}"
         }
       },
       "id": "disarm",

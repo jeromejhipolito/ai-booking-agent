@@ -169,7 +169,11 @@ docker run -d --name booking-pg-local \
   -e POSTGRES_USER=n8n -e POSTGRES_PASSWORD=n8n -e POSTGRES_DB=salon_booking \
   -p 5545:5432 pgvector/pgvector:pg16
 
-for f in init-db booking-schema agent-schema seed-demo-salon; do
+# Every schema file, in order — phase3 and phase4 are NOT optional extras. They add
+# notification_log.recipient_ref and the review uniqueness that the workflows' SQL names
+# directly; without them the agent's single save statement fails to parse, no pending
+# read-back is ever written, and nothing can be confirmed.
+for f in init-db booking-schema agent-schema phase3-schema phase4-schema seed-demo-salon; do
   docker exec -i booking-pg-local psql -U n8n -d salon_booking < deploy/$f.sql
 done
 
@@ -181,14 +185,17 @@ python3 scripts/ingest_kb.py --prune
 ollama pull qwen2.5:7b-instruct
 
 # 4. n8n on :5678 — then create two credentials in the UI: a Postgres one pointing at
-#    localhost:5545, and an Ollama one pointing at http://127.0.0.1:11434
-npx n8n start
+#    localhost:5545, and an Ollama one pointing at http://127.0.0.1:11434.
+#    HARNESS_TOKEN must be in N8N'S OWN environment, so it goes on this line — exporting it
+#    later only reaches the shell running the Python, and the harness would refuse everything.
+HARNESS_TOKEN=any-long-random-string npx n8n start
 
 # 5. import the workflows (Settings → n8n API → create a key)
 N8N_API_KEY=... python3 scripts/import_workflows.py --activate
 
-# 6. prove it — the harness fails closed, so give it a token and turn it on by hand
-export HARNESS_TOKEN=any-long-random-string   # the same value must be in n8n's environment
+# 6. prove it. The importer deliberately leaves `90 · dev: tool test harness` deactivated —
+#    switch it on in the n8n UI for the duration of the run, and off again afterwards.
+export HARNESS_TOKEN=any-long-random-string   # the SAME value as step 4
 python3 scripts/verify_tools.py      # the booking tools
 python3 scripts/verify_chat.py       # the whole conversation
 python3 scripts/verify_proactive.py  # reminders, backfill, stylist declines

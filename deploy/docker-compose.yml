@@ -3,8 +3,11 @@
 #
 #   1) cp ../.env.example ../.env  &&  edit it
 #   2) docker compose --env-file ../.env up -d
-#   3) docker compose exec -T postgres psql -U $POSTGRES_USER -d $POSTGRES_DB < booking-schema.sql
-#      docker compose exec -T postgres psql -U $POSTGRES_USER -d $POSTGRES_DB < seed-demo-salon.sql
+#   3) apply EVERY schema file, in this order — phase3 and phase4 are not optional extras, the
+#      workflows' SQL names notification_log.recipient_ref and the review uniqueness directly:
+#      for f in booking-schema agent-schema phase3-schema phase4-schema seed-demo-salon; do
+#        docker compose exec -T postgres psql -U $POSTGRES_USER -d $POSTGRES_DB < $f.sql
+#      done
 #   4) docker compose exec ollama ollama pull bge-m3      # only needed from phase 2
 #   5) open https://$DOMAIN → create the n8n owner account → import ../workflows/*.json
 #

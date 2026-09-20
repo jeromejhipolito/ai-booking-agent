@@ -104,6 +104,12 @@ def appts(user: str) -> int:
                        f"where c.channel_user_id = 'chat-{user}' and a.status='confirmed'"))
 
 
+def pending_kind(user: str) -> str:
+    """Which authorisation the server is holding for this conversation, if any."""
+    return vt.psql(f"select coalesce(pending_booking ->> 'kind', '') from bot_user_profile "
+                   f"where user_key = 'telegram:chat-{user}'")
+
+
 def pending_date(user: str) -> str:
     """The date the SERVER now holds for this conversation, whatever prose came back."""
     return vt.psql(f"select coalesce(pending_booking ->> 'date', '') from bot_user_profile "
@@ -300,6 +306,33 @@ def main() -> int:
     check("AC-4 confirming the cancel frees the appointment",
           appts(u) == 0 and vt.psql(f"select status from appointment where ref='{ref}'") == "cancelled",
           r[:200])
+    # This half was missing, and it is where the bug actually lived: the cancel was dispatched
+    # from the pending row regardless of intent, but its REPLY still sat behind intent=='cancel',
+    # so a bare "yes" cancelled the appointment and answered "Hello! I'm the front desk at Studio
+    # Kalye". Asserting DB state alone could never see it.
+    # Deliberately matched on a CONFIRMATION, not just the word "cancel": the buggy reply was
+    # "You have a few coming up — which one shall I cancel?", which contains it. A test that
+    # passes against the defect it was written for is not a test.
+    check("AC-4 and the customer is TOLD it was cancelled, not greeted",
+          re.search(r"\bdone\b|is cancelled|was cancelled", r, re.I) is not None
+          and re.search(r"front desk|not something I can help|which one shall I cancel", r, re.I) is None
+          and pending_kind(u) == "",
+          f"pending={pending_kind(u)!r} reply={r[:200]}")
+    # "cancel" lives in the refusal vocabulary, so answering a cancel read-back with the word
+    # itself was scored as "no, leave it" — the customer believed they had cancelled, the chair
+    # stayed blocked, and the stylist was never told.
+    u4b = "cancel-word"
+    say(u4b, f"haircut on {wed} at 11:00"); say(u4b, "Rob Diaz"); say(u4b, "09170000009")
+    say(u4b, "yes")
+    if appts(u4b) == 1:
+        say(u4b, "i want to cancel my appointment")
+        r4b = say(u4b, "cancel it")
+        check("AC-4 'cancel it' answering a cancel read-back confirms it, it is not a refusal",
+              appts(u4b) == 0, f"rows={appts(u4b)} reply={r4b[:160]}")
+    else:
+        check("AC-4 'cancel it' answering a cancel read-back confirms it, it is not a refusal",
+              False, "setup booking did not take")
+
     r = say(u, f"actually can i rebook that haircut on {tue} at 14:15?")
     say(u, "yes")
     check("AC-42 the freed slot can be booked again by the same person "

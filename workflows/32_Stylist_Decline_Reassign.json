@@ -150,7 +150,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const d = $('Decide the replacement').first().json || {};\nlet sends = [];\ntry { sends = $('Tell the client (and the manager)').all().map(s => s.json || {}); } catch (e) { sends = []; }\nreturn [{ json: Object.assign({}, d._result || { ok: false, reason: 'unknown' },\n                              { notices: sends.map(s => `${s.recipient}/${s.kind}:${s.reason}`) }) }];\n"
+        "jsCode": "// The verdict comes from 'Notices to send', not from 'Decide the replacement'. Decide PROPOSES\n// a replacement and says consent_requested; Notices is the node that finds out whether the\n// authorising pending row was actually written, and downgrades to consent_not_asked when it was\n// not. Reading Decide's copy reported that the customer had been asked for consent when nobody\n// had asked them anything.\nconst notices = $('Notices to send').all().map(i => i.json || {});\nconst verdict = (notices.find(j => j._result) || {})._result\n             || ($('Decide the replacement').first().json || {})._result\n             || { ok: false, reason: 'unknown' };\nlet sends = [];\ntry { sends = $('Tell the client (and the manager)').all().map(s => s.json || {}); } catch (e) { sends = []; }\nreturn [{ json: Object.assign({}, verdict,\n                              { notices: sends.map(s => `${s.recipient}/${s.kind}:${s.reason}`) }) }];\n"
       },
       "id": "res",
       "name": "Result",

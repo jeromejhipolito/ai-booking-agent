@@ -47,7 +47,7 @@
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1.2,
       "position": [
-        460,
+        620,
         0
       ],
       "onError": "continueRegularOutput",
@@ -63,7 +63,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
       "position": [
-        690,
+        850,
         0
       ]
     },
@@ -81,6 +81,37 @@
       "position": [
         0,
         -350
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-wf",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              },
+              "leftValue": "={{ $json._workflow_id }}",
+              "rightValue": ""
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "gate",
+      "name": "Routed to a tool?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        430,
+        0
       ]
     }
   ],
@@ -100,7 +131,7 @@
       "main": [
         [
           {
-            "node": "Call the tool",
+            "node": "Routed to a tool?",
             "type": "main",
             "index": 0
           }
@@ -109,6 +140,24 @@
     },
     "Call the tool": {
       "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Routed to a tool?": {
+      "main": [
+        [
+          {
+            "node": "Call the tool",
+            "type": "main",
+            "index": 0
+          }
+        ],
         [
           {
             "node": "Respond",

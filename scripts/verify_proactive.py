@@ -402,11 +402,31 @@ def main() -> int:
     row = psql("select rating||'|'||sentiment||'|'||coalesce(comment,'-') from review")
     check("five stars stores praise with the customer's own words",
           row.startswith("5|praise|Maria was lovely"), row)
+    # `... if False else ...` used to swallow the second half of this, so "verbatim" was untested
+    # for every run it was green. It also checked notification_log.detail, which holds the DELIVERY
+    # OUTCOME ('delivered', 'logged, no transport configured') and never the message body — so the
+    # half that was switched off could not have passed anyway.
+    #
+    # What is actually assertable, and is the real guarantee: the customer's words are stored
+    # unaltered, and the manager notice is composed from that column in SQL — so nothing between
+    # the customer and the manager can paraphrase, truncate or summarise it.
+    stored = psql("select coalesce(comment, '') from review")
     check("and the manager is told, verbatim",
           "manager/review_praise/manager" in notices("P4-REV")
-          and "Maria was lovely" in psql("select detail from notification_log where recipient='manager'")
-              + psql("select text from (select 1) t") if False else
-          "manager/review_praise/manager" in notices("P4-REV"), str(notices("P4-REV")))
+          and stored == "Maria was lovely, best cut I have had",
+          f"notices={notices('P4-REV')} stored={stored!r}")
+
+    # A neutral review warrants no manager notice. Chained behind the manager branch, that meant
+    # no items reached the result node and the sub-workflow returned nothing — so a review that IS
+    # in the table was reported to the customer as "I couldn't record it just now", with the
+    # UNIQUE then blocking any retry. Unreviewed by the suite until it bit.
+    r = leave_review("3, it was fine")
+    stored3 = psql("select rating||'|'||sentiment from review")
+    check("a neutral review is stored AND the customer is told it landed",
+          stored3.startswith("3|") and "couldn't record" not in r and len(r) > 5,
+          f"stored={stored3!r} reply={r[:160]}")
+    check("a neutral review reaches no manager",
+          "manager" not in " ".join(notices("P4-REV")), str(notices("P4-REV")))
 
     r = leave_review("1, I waited 40 minutes and the cut was rushed")
     row = psql("select rating||'|'||sentiment from review")
