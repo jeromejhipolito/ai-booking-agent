@@ -4,10 +4,8 @@ An n8n automation where the **conversation is the booking system**. A client mes
 the agent works out what they want, checks the diary, reads the booking back, and takes it only
 when they say yes.
 
-> **Status: phases 1–3 of 4 complete.** The schema, the booking tools, the conversational agent and
-> the proactive automation — reminders, filling cancellations from a waitlist, a stylist who can't
-> make a shift — are built and verified end to end against a live stack. Reviews routed to the
-> manager is phase 4.
+> **Complete.** Schema, booking tools, conversational agent, proactive automation and review
+> capture — all built and verified end to end against a live stack, 135 live assertions.
 
 ```
 Customer: hi, i'd like a haircut
@@ -27,6 +25,8 @@ Customer: yes
    Salon: You're all set — Haircut with Bea Cruz on 2026-09-22 14:15, P450.
           Your reference is BK-00071. See you then!
 ```
+
+![Booking a haircut in chat, and a slot that has gone being declined with real alternatives](docs/images/ai-booking-agent-conversation.png)
 
 ## The idea that shapes everything here
 
@@ -105,6 +105,15 @@ you decide who touches your hair. Say no and you keep your stylist, with a resch
 cancellation offered and a human told. Say yes and the move is re-checked at that moment — if the
 replacement got busy while you were deciding, nothing changes and you are told.
 
+**Asking how it went.** Half an hour after an appointment ends the agent asks for a rating and a
+line about it, once. The **rating decides** the classification — four or five is praise, one or two
+is a complaint; a model's read of the words only breaks the tie at three stars. Praise *and*
+complaints both go to the manager, verbatim, because you cannot coach a team on complaints alone.
+A complaint never gets a defensive reply: you are thanked, told a person will follow up, and that
+is the end of the message.
+
+![A one-star review stored as a complaint and forwarded to the manager verbatim](docs/images/ai-booking-agent-review.png)
+
 ## What's built
 
 | File | What it is |
@@ -121,8 +130,10 @@ replacement got busy while you were deciding, nothing changes and you are told.
 | `workflows/31_Cancellation_Backfill.json` | A freed slot goes to whoever has been waiting longest. |
 | `workflows/32_Stylist_Decline_Reassign.json` | A stylist can't make it — ask the customer first. |
 | `workflows/39_send_notification.json` | Claim, then send. The exactly-once guard everything else leans on. |
+| `workflows/40_Review_Capture.json` | Marks appointments complete and asks how it went, once. |
+| `workflows/41_tool_submit_review.json` | Stores the review, classifies it, routes praise and complaints to a human. |
 | `workflows/90_dev_test_harness.json` | Dev-only webhook that calls any tool — or the whole conversation — by name. |
-| `scripts/verify_tools.py` · `verify_chat.py` · `verify_proactive.py` | 51 + 38 + 34 live assertions against a running stack. |
+| `scripts/verify_tools.py` · `verify_chat.py` · `verify_proactive.py` | 51 + 38 + 46 live assertions against a running stack. |
 | `scripts/ingest_kb.py` · `scripts/import_workflows.py` | Embed the FAQ; push workflows into n8n. |
 
 ## The response contract (tools)
@@ -145,7 +156,10 @@ output is byte-identical. A `starts_at` sent without an offset is read as salon-
 no DST, so that is exactly `+08:00`) and the resolved instant is echoed back.
 
 Full per-tool input/output and the complete `reason` enum: **[docs/TOOL_CONTRACTS.md](docs/TOOL_CONTRACTS.md)**.
-The reasoning behind the design decisions: **[docs/HARDENING.md](docs/HARDENING.md)**.
+How the pieces fit together, and the four constraints that carry the weight:
+**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+The reasoning behind every design decision, and the defects that shaped them:
+**[docs/HARDENING.md](docs/HARDENING.md)**.
 
 ## Run it locally
 
@@ -210,7 +224,7 @@ data disagreeing is the exact failure this design exists to prevent.
 ```
 scripts/verify_tools.py      51 passed, 0 failed
 scripts/verify_chat.py       38 passed, 0 failed
-scripts/verify_proactive.py  34 passed, 0 failed
+scripts/verify_proactive.py  46 passed, 0 failed
 ```
 
 Both run against a **self-hosted 7B model** — deliberately. A design whose whole premise is
@@ -249,6 +263,28 @@ mid-call.
 - **The retrieval threshold is a noise floor, not a decision.** Measured on this FAQ, in-scope and
   off-topic questions overlap (0.395–0.656 against 0.282–0.491), so the prompt decides whether the
   notes actually answer the question. See [docs/HARDENING.md](docs/HARDENING.md).
+
+## What this demonstrates
+
+Honestly: it is a salon booking demo. There is no real salon. What it is actually a worked example
+of is **building on a model you do not trust**.
+
+- Every consequential decision is pushed below the model — into code that is tested, or into a
+  constraint that cannot have an opinion. The model reads a sentence into a form; that is all.
+- Authorisation for a real-world action lives in the database (a pending row written when the agent
+  actually showed you something), never in a field the model emits. An injected "confirm it
+  immediately" sets that field happily and changes nothing.
+- The whole suite runs against a **deliberately weak self-hosted model**, because every defect a
+  weak model exposes is a defect in the code around it — and behind a sharper one those same defects
+  ship silently and fail in front of a customer instead.
+- Side effects that must happen once claim a row before they act, and give the claim back if the
+  act fails. A reminder marked sent that never arrived is worse than one still pending.
+- Three adversarial test passes (134, 95, 83 and 40 candidate cases) ran *before* the code, and
+  caught two schema defects and a dozen behaviours that would otherwise have been found by a
+  customer.
+
+The parts that would need real work before a real salon used it are listed under Known limits, not
+hidden.
 
 ## Stack
 

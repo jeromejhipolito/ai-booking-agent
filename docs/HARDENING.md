@@ -233,3 +233,43 @@ Phase 1's tools are consumed unmodified. Phase 2's core gains three branches (wa
 waitlist join, reassignment consent) and one reordering — an outstanding question the agent asked is
 now answered before any guess at the customer's intent. **Re-verified:** phase 1's 51 and phase 2's
 38 assertions both still pass unchanged.
+
+---
+
+# Hardening notes — phase 4/4 (reviews)
+
+40 adversarial cases, triaged. Three changed the design.
+
+## Self-derived AC
+
+| AC | Given / When / Then |
+|---|---|
+| AC-1 | A completed appointment produces exactly one review request. |
+| AC-2 | A five-star reply stores praise and tells the manager. |
+| AC-3 | A one-star reply stores a complaint, tells the manager, and the reply contains no defence. |
+| AC-4 | Three stars is stored, and only escalated if the sentiment reading says complaint. |
+| AC-5 | The customer's comment reaches the manager unaltered. |
+
+## Hardened items
+
+| # | Class | Requirement | Matrix case |
+|---|---|---|---|
+| R-A | idempotency | One review per appointment, enforced by a **UNIQUE constraint** — two replies arriving together ("5, lovely" then "actually 2, it was bad") race straight past a check-then-insert. | 5, 6 |
+| R-B | permission | The review is stored against the appointment in the **server-side pending row**, never a reference the customer or the model typed — a leaked ref would otherwise let someone review a stranger's haircut. | 3, 4, 37 |
+| R-C | data contract | A rating is a whole 1–5 the customer actually gave. "I'd give it 10/10" and "I waited 40 minutes" store **no rating at all** rather than an invented one; the words then stand on their own. | 19–25 |
+| R-D | state/lifecycle | Completion keys on `ends_at`, not `starts_at` — nobody is asked how their cut went while they are still in the chair — and only `confirmed` appointments ever become `completed`. | 8–12 |
+| R-E | state | The review ask never overwrites a pending a live conversation is waiting on, and answering it with a booking request drops the ask instead of trapping the customer in it. | 38, 39 |
+| R-F | integration | A manager copy that never went out is **re-sent on the next sweep** — 39 releases the claim on a failed send, so the absence of a log row is the signal. Without it the feedback is stored and nobody ever reads it. | 15, 40 |
+| R-G | security | The comment is stored and rendered as inert text; the manager's notice is built by code from the stored row, so an injection aimed at whoever reads it is just words. | 34, 35, 36 |
+| R-H | boundary | Nobody is asked about a haircut from three months ago, and nobody is asked at three in the morning. | 13 |
+| R-I | negative | A weak model that returns nothing for an unusual message does not lose the customer's words — an outstanding review ask takes the raw message as the comment, unless it is plainly a new request. | 31, 32, 36 |
+
+## Decisions taken (logged, not asked)
+
+| Decision | Chosen default | Why |
+|---|---|---|
+| Who decides praise vs complaint | **the rating**, with the model only breaking a 3-star tie | A number the customer chose is not something a model gets to reinterpret. |
+| Praise routed to the manager too | yes | You cannot coach a team on complaints alone, and a stylist who did well should hear it. |
+| `escalated_at` | set when the review is stored, meaning "this warranted a human" | Delivery truth lives in `notification_log`; the retry sweep closes the gap between the two. |
+| The reply to a complaint | thanks, then silence | No "but", no explanation, no discount offered by a bot. A person follows up. |
+| A comment with no rating | stored, classified from the sentiment reading alone | Most people write a sentence and skip the stars. |

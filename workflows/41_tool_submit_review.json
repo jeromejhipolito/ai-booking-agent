@@ -1,0 +1,208 @@
+{
+  "name": "41 \u00b7 tool: submit review",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "t",
+      "name": "When called by the agent",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The rating has to be a number the customer actually chose, not one parsed out of prose.\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  const s = (v) => (v === null || v === undefined ? null : String(v).trim() || null);\n  let rating = null;\n  if (j.rating !== null && j.rating !== undefined && String(j.rating).trim() !== '') {\n    const n = Number(j.rating);\n    // Non-integers and out-of-range values are rejected rather than clamped: \"10/10\" meaning\n    // ten stars out of five is a misunderstanding, and storing 5 would be inventing an answer.\n    rating = Number.isInteger(n) ? n : NaN;\n  }\n  const hint = ['praise', 'complaint', 'neutral'].indexOf(s(j.sentiment)) >= 0 ? s(j.sentiment) : 'neutral';\n  out.push({ json: {\n    booking_ref: s(j.booking_ref),\n    rating: rating === null ? null : rating,\n    comment: (s(j.comment) || '').slice(0, 2000),      // bounded, never truncated mid-decision\n    hint, user_key: s(j.user_key),\n    invalid: (!s(j.booking_ref) || !s(j.user_key)) ? 'invalid_input'\n             : (rating !== null && !Number.isInteger(rating)) ? 'invalid_rating' : null,\n  } });\n}\nif (out.length === 0) out.push({ json: { booking_ref: null, invalid: 'invalid_input' } });\nreturn out;\n"
+      },
+      "id": "val",
+      "name": "Validate input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        230,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Store one review and decide, in the database, whether a human needs to see it.\n--\n-- The rating is authoritative: a number the customer chose cannot be talked out of by a model.\n-- The model's sentiment only breaks the tie at 3 stars, or stands alone when someone left words\n-- and no rating at all.\nWITH p AS (\n  SELECT $1::text AS booking_ref, $2::int AS rating, $3::text AS comment, $4::text AS hint,\n         $5::text AS user_key\n), appt AS (\n  -- Only the customer's OWN completed appointment. Reviewing someone else's, or one that never\n  -- happened, is not a review.\n  SELECT a.* FROM appointment a\n  JOIN client c ON c.id = a.client_id\n  WHERE a.ref = (SELECT booking_ref FROM p)\n    AND c.channel || ':' || c.channel_user_id = (SELECT user_key FROM p)\n), checks AS (\n  SELECT\n    (SELECT count(*) FROM appt) > 0 AS found,\n    (SELECT status FROM appt) AS status,\n    COALESCE((SELECT rating FROM p) IS NULL\n             OR (SELECT rating FROM p) BETWEEN 1 AND 5, false) AS rating_ok,\n    COALESCE(btrim((SELECT comment FROM p)) <> '' OR (SELECT rating FROM p) IS NOT NULL, false) AS has_content,\n    EXISTS (SELECT 1 FROM review r, appt WHERE r.appointment_id = appt.id) AS already_reviewed\n), verdict AS (\n  SELECT CASE\n    WHEN (SELECT rating FROM p) >= 4 THEN 'praise'\n    WHEN (SELECT rating FROM p) <= 2 THEN 'complaint'\n    -- 3 stars, or words with no stars: the model's read is the only signal there is.\n    WHEN (SELECT hint FROM p) IN ('praise','complaint') THEN (SELECT hint FROM p)\n    ELSE 'neutral'\n  END AS sentiment\n), ins AS (\n  INSERT INTO review (appointment_id, client_id, stylist_id, rating, comment, sentiment, escalated_at)\n  SELECT a.id, a.client_id, a.stylist_id, p.rating, NULLIF(btrim(p.comment), ''), v.sentiment,\n         CASE WHEN v.sentiment <> 'neutral' THEN now() END\n  FROM appt a, p, verdict v, checks c\n  WHERE c.found AND c.status = 'completed' AND c.rating_ok AND c.has_content AND NOT c.already_reviewed\n  RETURNING id, appointment_id, sentiment, rating, comment\n)\nSELECT json_build_object(\n  'found', (SELECT found FROM checks), 'status', (SELECT status FROM checks),\n  'rating_ok', (SELECT rating_ok FROM checks), 'has_content', (SELECT has_content FROM checks),\n  'already_reviewed', (SELECT already_reviewed FROM checks),\n  'stored', (SELECT count(*) FROM ins) > 0,\n  'review', (SELECT json_build_object(\n      'id', i.id, 'appointment_id', i.appointment_id, 'sentiment', i.sentiment,\n      'rating', i.rating, 'comment', i.comment,\n      'stylist_name', st.name, 'client_name', c.name, 'service_name', sv.name,\n      'ref', a.ref,\n      'when_local', to_char(a.starts_at AT TIME ZONE 'Asia/Manila', 'Dy DD Mon, HH24:MI'))\n    FROM ins i\n    JOIN appointment a ON a.id = i.appointment_id\n    JOIN stylist st ON st.id = a.stylist_id\n    JOIN service sv ON sv.id = a.service_id\n    JOIN client  c  ON c.id  = a.client_id)\n) AS result;",
+        "options": {
+          "queryReplacement": "={{ [$json.booking_ref, $json.rating, $json.comment, $json.hint, $json.user_key] }}"
+        }
+      },
+      "id": "q",
+      "name": "Store and classify",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        460,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "sPRRlnWxeFGhEZbe",
+          "name": "Salon Booking Postgres (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// A closed contract, and the manager notice as a second item when one is warranted.\nconst checked = $('Validate input').all();\nconst out = [];\nconst rows = $input.all();\nfor (let i = 0; i < rows.length; i++) {\n  const v = (checked[i] || checked[0] || {}).json || {};\n  const row = (rows[i] || {}).json || {};\n  if (v.invalid)  { out.push({ json: { ok: false, reason: v.invalid } }); continue; }\n  if (row.error !== undefined || !row.result) { out.push({ json: { ok: false, reason: 'db_unavailable' } }); continue; }\n  const d = row.result;\n  if (!d.found)             { out.push({ json: { ok: false, reason: 'booking_not_found' } }); continue; }\n  if (d.status !== 'completed') { out.push({ json: { ok: false, reason: 'not_completed' } }); continue; }\n  if (!d.rating_ok)         { out.push({ json: { ok: false, reason: 'invalid_rating' } }); continue; }\n  if (!d.has_content)       { out.push({ json: { ok: false, reason: 'empty_review' } }); continue; }\n  if (d.already_reviewed)   { out.push({ json: { ok: false, reason: 'already_reviewed' } }); continue; }\n  if (!d.stored || !d.review) { out.push({ json: { ok: false, reason: 'not_stored' } }); continue; }\n  const r = d.review;\n  out.push({ json: { ok: true, data: { sentiment: r.sentiment, rating: r.rating, ref: r.ref,\n                                       stylist_name: r.stylist_name },\n    // Praise AND complaints both reach the manager: you cannot coach a team on complaints alone.\n    _notice: r.sentiment === 'neutral' ? null : {\n      appointment_id: r.appointment_id, recipient: 'manager',\n      kind: 'review_' + r.sentiment,\n      text: `${r.sentiment === 'praise' ? 'Praise' : 'Complaint'} for ${r.stylist_name} \u2014 `\n          + `${r.service_name} on ${r.when_local} (${r.ref}), ${r.rating === null ? 'no rating' : r.rating + '/5'} `\n          + `from ${r.client_name}:\\n\"${r.comment || '(no comment left)'}\"` } } });\n}\nif (out.length === 0) out.push({ json: { ok: false, reason: 'invalid_input' } });\nreturn out;\n"
+      },
+      "id": "resp",
+      "name": "Respond",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        690,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Only the reviews that warrant a human become items for the sender.\nreturn $('Respond').all()\n  .filter(i => ((i.json || {}).data) && (i.json._notice))\n  .map(i => ({ json: i.json._notice }));\n"
+      },
+      "id": "notice",
+      "name": "Manager copy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "6EOMx2mTG4SiFTzs",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "send",
+      "name": "Tell the manager",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1150,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// The verdict is what the caller gets back; whether the manager's copy went out is an\n// operational detail that must never change what the customer is told.\nreturn $('Respond').all().map(i => {\n  const j = i.json || {};\n  return { json: j.ok ? { ok: true, data: j.data } : { ok: false, reason: j.reason } };\n});\n"
+      },
+      "id": "final",
+      "name": "Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "content": "## 41 \u00b7 tool: submit review\\n\\n**In** `{booking_ref, rating, comment, sentiment, user_key}` \u00b7 **Out** `{ok:true,data}` or `{ok:false,reason}`\\n\\nThe **rating decides** \u2014 4+ is praise, 2- is a complaint. A model's read of the words only breaks the tie at 3 stars, or stands alone when someone left words and no stars. A number the customer chose is not something a model gets to reinterpret.\\n\\nOnly the customer's OWN completed appointment can be reviewed, and only once.\\n\\nPraise AND complaints both reach the manager, verbatim \u2014 you cannot coach a team on complaints alone. Neutral is stored and left alone.\\n\\n`reason`: `invalid_input` \u00b7 `invalid_rating` \u00b7 `booking_not_found` \u00b7 `not_completed` \u00b7 `empty_review` \u00b7 `already_reviewed` \u00b7 `db_unavailable`",
+        "height": 320,
+        "width": 860,
+        "color": 4
+      },
+      "id": "n41",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -360
+      ]
+    }
+  ],
+  "connections": {
+    "When called by the agent": {
+      "main": [
+        [
+          {
+            "node": "Validate input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate input": {
+      "main": [
+        [
+          {
+            "node": "Store and classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store and classify": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond": {
+      "main": [
+        [
+          {
+            "node": "Manager copy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manager copy": {
+      "main": [
+        [
+          {
+            "node": "Tell the manager",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tell the manager": {
+      "main": [
+        [
+          {
+            "node": "Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {}
+}

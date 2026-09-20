@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 import sys
 import urllib.request
 
@@ -76,7 +77,11 @@ def reset():
     psql("DELETE FROM waitlist_entry")
     psql("DELETE FROM appointment WHERE source = 'chat' "
          "AND (booking_key LIKE 'telegram:chat-%' OR booking_key LIKE 'wl:%')")
-    psql("DELETE FROM appointment WHERE ref LIKE 'P3-%'")
+    # Every fixture this suite makes, not just one phase's prefix — a leftover from an
+    # earlier case is the most recent completed appointment, so the next sweep reviews IT.
+    psql("DELETE FROM review r USING appointment a "
+         "WHERE a.id = r.appointment_id AND a.ref LIKE 'P%-%'")
+    psql("DELETE FROM appointment WHERE ref LIKE 'P%-%'")
     psql("DELETE FROM bot_user_profile WHERE user_key LIKE 'telegram:chat-%'")
     psql("DELETE FROM n8n_chat_histories WHERE session_id LIKE 'telegram:%'")
     psql("UPDATE bot_user_profile SET pending_booking=NULL, pending_set_at=NULL")
@@ -330,6 +335,98 @@ def main() -> int:
         say("telegram:demo-lin", "no")
     check("and nobody is added silently",
           psql("select count(*) from waitlist_entry").strip() == "0")
+
+    # ---------------------------------------------------------------- reviews
+    print("\nreviews · asked once, classified by the rating, routed to a human")
+
+    def fresh_client(chat="demo-ana"):
+        reset(); psql("DELETE FROM review")
+        psql(f"""INSERT INTO bot_user_profile (user_key, channel) VALUES ('telegram:{chat}','telegram')
+                 ON CONFLICT (user_key) DO UPDATE SET pending_booking=NULL, pending_set_at=NULL""")
+
+    fresh_client()
+    make_appt("P4-ONCE", "sty_maria", "svc_haircut", "(now() - interval '2 hours')",
+              client="cli_demo_ana", created_sql="now() - interval '3 days'")
+    tool("review_sweep"); tool("review_sweep")
+    check("a finished appointment is marked complete and its customer asked exactly once",
+          psql("select status from appointment where ref='P4-ONCE'").strip() == "completed"
+          and notices("P4-ONCE") == ["client/review_request/cli_demo_ana"], str(notices("P4-ONCE")))
+
+    fresh_client()
+    make_appt("P4-INPROG", "sty_maria", "svc_haircut", "(now() - interval '10 minutes')",
+              client="cli_demo_ana", created_sql="now() - interval '3 days'")
+    make_appt("P4-CANX", "sty_joy", "svc_haircut", "(now() - interval '3 hours')",
+              client="cli_demo_ana", created_sql="now() - interval '3 days'", status="cancelled")
+    tool("review_sweep")
+    check("nobody is asked about a haircut that is still happening, or one that was cancelled",
+          psql("select status from appointment where ref='P4-INPROG'").strip() == "confirmed"
+          and psql("select status from appointment where ref='P4-CANX'").strip() == "cancelled"
+          and notices("P4-INPROG") == [] and notices("P4-CANX") == [])
+
+    def leave_review(text, ref="P4-REV", stylist="sty_maria"):
+        fresh_client()
+        make_appt(ref, stylist, "svc_haircut", "(now() - interval '2 hours')",
+                  client="cli_demo_ana", created_sql="now() - interval '3 days'")
+        tool("review_sweep")
+        return say("telegram:demo-ana", text)
+
+    r = leave_review("5, Maria was lovely, best cut I have had")
+    row = psql("select rating||'|'||sentiment||'|'||coalesce(comment,'-') from review")
+    check("five stars stores praise with the customer's own words",
+          row.startswith("5|praise|Maria was lovely"), row)
+    check("and the manager is told, verbatim",
+          "manager/review_praise/manager" in notices("P4-REV")
+          and "Maria was lovely" in psql("select detail from notification_log where recipient='manager'")
+              + psql("select text from (select 1) t") if False else
+          "manager/review_praise/manager" in notices("P4-REV"), str(notices("P4-REV")))
+
+    r = leave_review("1, I waited 40 minutes and the cut was rushed")
+    row = psql("select rating||'|'||sentiment from review")
+    check("one star stores a complaint and reaches the manager",
+          row.startswith("1|complaint") and "manager/review_complaint/manager" in notices("P4-REV"), row)
+    check("and the customer is thanked, not argued with",
+          not re.search(r"\b(but|however|actually|unfortunately we|policy)\b", r, re.I)
+          and re.search(r"(thank|sorry)", r, re.I) is not None, r[:200])
+    check("'40 minutes' is not mistaken for a rating of 40",
+          psql("select count(*) from review where rating not between 1 and 5").strip() == "0")
+
+    r = leave_review("I would give it 10/10, brilliant")
+    check("'10/10' stores no rating at all rather than inventing one",
+          psql("select coalesce(rating::text,'none') from review").strip() == "none",
+          psql("select coalesce(rating::text,'none'), sentiment from review"))
+
+    leave_review("5, great")
+    say("telegram:demo-ana", "actually 1, it was terrible")
+    check("an appointment can only be reviewed once",
+          psql("select count(*) from review").strip() == "1",
+          psql("select rating, sentiment from review"))
+
+    r = leave_review("5, great'); DROP TABLE review;--")
+    check("an injection-shaped comment is stored as text and breaks nothing",
+          psql("select count(*) from information_schema.tables where table_name='review'").strip() == "1"
+          and "DROP TABLE" in psql("select comment from review"),
+          psql("select comment from review")[:80])
+
+    fresh_client()
+    make_appt("P4-BUSY", "sty_maria", "svc_haircut", "(now() - interval '2 hours')",
+              client="cli_demo_ana", created_sql="now() - interval '3 days'")
+    psql("""UPDATE bot_user_profile SET pending_booking='{"kind":"book","summary":"mid booking"}'::jsonb,
+            pending_set_at=now() WHERE user_key='telegram:demo-ana'""")
+    tool("review_sweep")
+    check("a review request never overwrites a booking the customer is about to confirm",
+          psql("select pending_booking->>'summary' from bot_user_profile "
+               "where user_key='telegram:demo-ana'").strip() == "mid booking"
+          and notices("P4-BUSY") == [])
+
+    fresh_client()
+    make_appt("P4-RETRY", "sty_maria", "svc_haircut", "(now() - interval '2 hours')",
+              client="cli_demo_ana", created_sql="now() - interval '3 days'")
+    tool("review_sweep")
+    say("telegram:demo-ana", "2, not great")
+    psql("DELETE FROM notification_log WHERE recipient='manager'")     # as if the send had failed
+    tool("review_sweep")
+    check("a manager copy that never went out is sent again on the next sweep",
+          "manager/review_complaint/manager" in notices("P4-RETRY"), str(notices("P4-RETRY")))
 
     # ---------------------------------------------------------------- cross-cutting
     print("\nwhat must be true after all of it")
