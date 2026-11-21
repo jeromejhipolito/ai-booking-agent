@@ -1,0 +1,127 @@
+{
+  "name": "24 · tool: reassign booking",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "t",
+      "name": "When called by the agent",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  const s = (v) => (v === null || v === undefined ? null : String(v).trim() || null);\n  const booking_ref = s(j.booking_ref), to_stylist = s(j.to_stylist_id), from_stylist = s(j.from_stylist_id);\n  out.push({ json: { booking_ref, to_stylist, from_stylist,\n                     invalid: (booking_ref && to_stylist && from_stylist) ? null : 'invalid_input' } });\n}\nif (out.length === 0) out.push({ json: { booking_ref: null, to_stylist: null, from_stylist: null, invalid: 'invalid_input' } });\nreturn out;\n"
+      },
+      "id": "val",
+      "name": "Validate input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        230,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Move a confirmed appointment to another stylist. The EXCLUDE constraint is still the\n-- judge: if the replacement took another booking in that window while the customer was\n-- deciding, this changes nothing and says so. Always returns exactly one row.\nWITH p AS (\n  SELECT $1::text AS ref, $2::text AS to_stylist, $3::text AS from_stylist\n), tgt AS (\n  SELECT a.* FROM appointment a JOIN p ON a.ref = p.ref\n), checks AS (\n  SELECT\n    (SELECT count(*) FROM tgt) > 0 AS found,\n    (SELECT status FROM tgt) AS status,\n    COALESCE((SELECT starts_at FROM tgt) > now(), false) AS in_future,\n    -- The decline must still be about the stylist who actually holds it: a second decline\n    -- after the move already happened must not bounce the customer around again.\n    COALESCE((SELECT stylist_id FROM tgt) = (SELECT from_stylist FROM p), false) AS still_theirs,\n    EXISTS (SELECT 1 FROM stylist st, p WHERE st.id = p.to_stylist AND st.active) AS to_exists,\n    EXISTS (SELECT 1 FROM stylist_service ss, p, tgt\n            WHERE ss.stylist_id = p.to_stylist AND ss.service_id = tgt.service_id) AS to_performs,\n    EXISTS (SELECT 1 FROM appointment b, p, tgt\n            WHERE b.stylist_id = p.to_stylist AND b.status = 'confirmed' AND b.id <> tgt.id\n              AND tstzrange(b.starts_at, b.ends_at) && tstzrange(tgt.starts_at, tgt.ends_at)) AS to_busy,\n    EXISTS (SELECT 1 FROM business_hours bh, p, tgt\n            WHERE bh.stylist_id = p.to_stylist\n              AND bh.weekday = EXTRACT(DOW FROM (tgt.starts_at AT TIME ZONE 'Asia/Manila')::date)::smallint\n              AND tgt.starts_at >= (((tgt.starts_at AT TIME ZONE 'Asia/Manila')::date + bh.opens_at)  AT TIME ZONE 'Asia/Manila')\n              AND tgt.ends_at   <= (((tgt.starts_at AT TIME ZONE 'Asia/Manila')::date + bh.closes_at) AT TIME ZONE 'Asia/Manila')) AS to_hours_ok\n), upd AS (\n  UPDATE appointment a\n     SET stylist_id = (SELECT to_stylist FROM p), updated_at = now(),\n         notes = COALESCE(a.notes || ' | ', '') || 'reassigned from ' || (SELECT from_stylist FROM p)\n    FROM p, checks c\n   WHERE a.ref = p.ref AND a.status = 'confirmed' AND c.found AND c.in_future AND c.still_theirs\n     AND c.to_exists AND c.to_performs AND c.to_hours_ok AND NOT c.to_busy\n  RETURNING a.ref, a.stylist_id, a.starts_at, a.ends_at, a.service_id, a.client_id\n)\nSELECT json_build_object(\n  'found', (SELECT found FROM checks), 'status', (SELECT status FROM checks),\n  'in_future', (SELECT in_future FROM checks), 'still_theirs', (SELECT still_theirs FROM checks),\n  'to_exists', (SELECT to_exists FROM checks), 'to_performs', (SELECT to_performs FROM checks),\n  'to_busy', (SELECT to_busy FROM checks), 'to_hours_ok', (SELECT to_hours_ok FROM checks),\n  'moved', (SELECT count(*) FROM upd) > 0,\n  'booking', (SELECT json_build_object(\n                'ref', u.ref, 'stylist_id', u.stylist_id, 'stylist_name', st.name,\n                'service_name', sv.name,\n                'starts_at_local', to_char(u.starts_at AT TIME ZONE 'Asia/Manila','YYYY-MM-DD HH24:MI'))\n              FROM upd u JOIN stylist st ON st.id = u.stylist_id\n                         JOIN service sv ON sv.id = u.service_id)\n) AS result;",
+        "options": {
+          "queryReplacement": "={{ [$json.booking_ref, $json.to_stylist, $json.from_stylist] }}"
+        }
+      },
+      "id": "q",
+      "name": "Query",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        460,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "sPRRlnWxeFGhEZbe",
+          "name": "Salon Booking Postgres (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// A lost race against the EXCLUDE constraint is not an outage — the replacement stylist\n// just got booked while we were asking. Saying 'db_unavailable' makes the agent flag a\n// manager instead of telling the customer the true, recoverable reason.\nfunction dbReason(errText) {\n  const e = String(errText || '');\n  if (e.includes('appointment_no_double_booking')) return 'replacement_busy';\n  if (e.includes('statement timeout') || e.includes('canceling statement')) return 'timeout';\n  return 'db_unavailable';\n}\n\nconst checked = $('Validate input').all();\nconst out = [];\nconst rows = $input.all();\nfor (let i = 0; i < rows.length; i++) {\n  const v = (checked[i] || checked[0] || {}).json || {};\n  const row = (rows[i] || {}).json || {};\n  if (v.invalid) { out.push({ json: { ok: false, reason: v.invalid } }); continue; }\n  if (row.error !== undefined || !row.result) { out.push({ json: { ok: false, reason: dbReason(row.error) } }); continue; }\n  const d = row.result;\n  if (!d.found)          { out.push({ json: { ok: false, reason: 'booking_not_found' } }); continue; }\n  if (d.status !== 'confirmed') { out.push({ json: { ok: false, reason: 'not_confirmed' } }); continue; }\n  if (!d.in_future)      { out.push({ json: { ok: false, reason: 'already_started' } }); continue; }\n  if (!d.still_theirs)   { out.push({ json: { ok: false, reason: 'already_reassigned' } }); continue; }\n  if (!d.to_exists)      { out.push({ json: { ok: false, reason: 'stylist_not_found' } }); continue; }\n  if (!d.to_performs)    { out.push({ json: { ok: false, reason: 'stylist_does_not_perform_service' } }); continue; }\n  if (!d.to_hours_ok)    { out.push({ json: { ok: false, reason: 'outside_business_hours' } }); continue; }\n  if (d.to_busy)         { out.push({ json: { ok: false, reason: 'replacement_busy' } }); continue; }\n  if (!d.moved || !d.booking) { out.push({ json: { ok: false, reason: 'not_moved' } }); continue; }\n  out.push({ json: { ok: true, data: d.booking } });\n}\nif (out.length === 0) out.push({ json: { ok: false, reason: 'invalid_input' } });\nreturn out;\n"
+      },
+      "id": "out",
+      "name": "Respond",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        690,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "content": "## 24 · tool: reassign booking\\n\\n**In** `{booking_ref, from_stylist_id, to_stylist_id}` · **Out** `{ok:true, data}` or `{ok:false, reason}`\\n\\nThe same closed contract as tools 20-23. Re-checks everything at the moment of the move rather than trusting the moment of the offer: the appointment is still confirmed, still in the future, still held by the stylist who declined, and the replacement performs the service, works those hours and is still free.\\n\\n`reason`: `invalid_input` · `booking_not_found` · `not_confirmed` · `already_started` · `already_reassigned` · `stylist_not_found` · `stylist_does_not_perform_service` · `outside_business_hours` · `replacement_busy` · `db_unavailable`",
+        "height": 320,
+        "width": 860,
+        "color": 4
+      },
+      "id": "n24",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -330
+      ]
+    }
+  ],
+  "connections": {
+    "When called by the agent": {
+      "main": [
+        [
+          {
+            "node": "Validate input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate input": {
+      "main": [
+        [
+          {
+            "node": "Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {}
+}

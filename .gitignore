@@ -1,0 +1,29 @@
+# --- secrets: never commit real values ---
+.env
+*.env
+!.env.example
+
+# keys / certs
+*.key
+*.pem
+*.pfx
+
+# local runtime state (data lives in Docker named volumes; ignore stray mounts/exports)
+n8n_data/
+postgres_data/
+ollama_data/
+caddy_data/
+caddy_config/
+
+# DB dumps only. NEVER a bare `*.sql` rule — deploy/*.sql is the schema docker-compose mounts,
+# and a blanket ignore silently drops it from the commit and breaks a fresh deploy.
+*.sql.gz
+backup-*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+__pycache__/

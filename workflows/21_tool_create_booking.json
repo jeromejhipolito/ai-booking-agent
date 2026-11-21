@@ -1,0 +1,128 @@
+{
+  "name": "21 · tool: create booking",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "trigger",
+      "name": "When called by the agent",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Phase 1 is deterministic: no LLM decides anything here.\n// Every code node iterates $input.all() — an n8n Code node in the default\n// \"Run Once for All Items\" mode that reads $json silently processes ONLY the first item,\n// which would drop bookings the moment a caller fans out.\nconst str = (v) => (typeof v === 'string' ? v.trim() : (v === null || v === undefined ? '' : String(v).trim()));\nconst nul = (v) => { const s = str(v); return s === '' ? null : s; };\n// Manila has no DST, so a bare local timestamp is exactly +08:00 — resolve it here and echo\n// the resolved instant back, rather than letting Postgres guess with the session TimeZone.\nconst MANILA = '+08:00';\nconst isoish = /^(\\d{4})-(\\d{2})-(\\d{2})[T ](\\d{2}):(\\d{2})(:\\d{2})?(\\.\\d+)?(Z|[+-]\\d{2}:?\\d{2}|[+-]\\d{2})?$/;\nfunction normaliseInstant(v) {\n  const s = str(v);\n  const m = isoish.exec(s);\n  if (!m) return null;\n  let base = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}${m[6] || ':00'}`;\n  let off = m[8];\n  if (!off) off = MANILA;                       // naked -> salon-local\n  else if (off !== 'Z') {\n    if (off.length === 3) off = off + ':00';     // +08   -> +08:00\n    else if (off.length === 5) off = off.slice(0, 3) + ':' + off.slice(3); // +0800 -> +08:00\n  }\n  const d = new Date(base + off);\n  return isNaN(d.getTime()) ? null : d.toISOString().replace(/\\.\\d{3}Z$/, 'Z');\n}\nfunction validDate(s) {\n  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return false;\n  const d = new Date(s + 'T00:00:00Z');\n  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  const c = j.client || {};\n  const booking_key = nul(j.booking_key);\n  const client_name = nul(c.name);\n  const service_id  = nul(j.service_id);\n  const stylist_id  = nul(j.stylist_id);\n  const starts_at   = normaliseInstant(j.starts_at);\n  let invalid = null;\n  if (!booking_key || !service_id || !stylist_id || !client_name) invalid = 'invalid_input';\n  else if (!str(j.starts_at)) invalid = 'invalid_input';\n  else if (!starts_at) invalid = 'invalid_timestamp';\n  out.push({ json: {\n    booking_key, client_name,\n    client_phone: nul(c.phone),\n    channel: nul(c.channel),\n    channel_user_id: nul(c.channel_user_id),\n    service_id, stylist_id, starts_at, notes: nul(j.notes),\n    invalid,\n  } });\n}\nif (out.length === 0) out.push({ json: { booking_key: null, invalid: 'invalid_input' } });\nreturn out;\n"
+      },
+      "id": "validate",
+      "name": "Validate input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH p AS (\n  SELECT $1::text AS booking_key, $2::text AS client_name, $3::text AS client_phone,\n         $4::text AS channel, $5::text AS channel_user_id, $6::text AS service_id,\n         $7::text AS stylist_id, $8::timestamptz AS starts_at, $9::text AS notes\n),\nsvc AS (SELECT s.* FROM service s JOIN p ON s.id = p.service_id WHERE s.active),\nwin AS (SELECT p.starts_at AS s, p.starts_at + make_interval(mins => svc.duration_min) AS e FROM p, svc),\nexisting AS (SELECT a.* FROM appointment a JOIN p ON a.booking_key = p.booking_key),\nchecks AS (\n  SELECT\n    (SELECT count(*) FROM existing) > 0 AS is_replay,\n    (SELECT count(*) FROM svc) > 0     AS service_ok,\n    EXISTS (SELECT 1 FROM stylist st, p WHERE st.id = p.stylist_id AND st.active) AS stylist_ok,\n    EXISTS (SELECT 1 FROM stylist_service ss, p\n            WHERE ss.stylist_id = p.stylist_id AND ss.service_id = p.service_id) AS performs,\n    EXISTS (SELECT 1 FROM business_hours bh, p, win\n            WHERE bh.stylist_id = p.stylist_id\n              AND bh.weekday = EXTRACT(DOW FROM (win.s AT TIME ZONE 'Asia/Manila')::date)::smallint\n              AND win.s >= (((win.s AT TIME ZONE 'Asia/Manila')::date + bh.opens_at)  AT TIME ZONE 'Asia/Manila')\n              AND win.e <= (((win.s AT TIME ZONE 'Asia/Manila')::date + bh.closes_at) AT TIME ZONE 'Asia/Manila')) AS hours_ok,\n    COALESCE((SELECT s FROM win) > now(), false) AS not_past,\n    EXISTS (SELECT 1 FROM appointment a, p, win\n            WHERE a.stylist_id = p.stylist_id AND a.status = 'confirmed'\n              AND tstzrange(a.starts_at, a.ends_at) && tstzrange(win.s, win.e)) AS taken\n),\ncli AS (\n  INSERT INTO client (id, name, phone, channel, channel_user_id)\n  SELECT 'cli_' || substr(md5(random()::text || clock_timestamp()::text), 1, 12),\n         p.client_name, p.client_phone, p.channel, p.channel_user_id\n  FROM p, checks c\n  WHERE c.service_ok AND c.stylist_ok AND c.performs AND c.hours_ok\n    AND c.not_past AND NOT c.taken AND NOT c.is_replay\n  ON CONFLICT (channel, channel_user_id) WHERE channel IS NOT NULL AND channel_user_id IS NOT NULL\n  DO UPDATE SET name = EXCLUDED.name,\n                phone = COALESCE(EXCLUDED.phone, client.phone),\n                updated_at = now()\n  RETURNING id\n),\nins AS (\n  INSERT INTO appointment (ref, booking_key, client_id, stylist_id, service_id, starts_at, ends_at, source, notes)\n  SELECT 'BK-' || lpad(nextval('appointment_ref_seq')::text, 5, '0'),\n         p.booking_key, cli.id, p.stylist_id, p.service_id, win.s, win.e, 'chat', p.notes\n  FROM p, win, cli\n  -- DO UPDATE, not DO NOTHING: when two calls carrying the SAME booking_key race, the loser's\n  -- DO NOTHING returns no row AND cannot see the winner's freshly committed row (one statement,\n  -- one snapshot) — so it would report failure for a booking that actually succeeded. DO UPDATE\n  -- waits for the winner, then returns that row. `xmax = 0` is how you tell a real insert from a\n  -- returned conflict.\n  ON CONFLICT (booking_key) DO UPDATE SET updated_at = now()\n  RETURNING appointment.ref, appointment.status, appointment.client_id, appointment.stylist_id,\n            appointment.service_id, appointment.starts_at, appointment.ends_at,\n            (xmax = 0) AS was_inserted\n),\nfinal AS (\n  SELECT ref, status, client_id, stylist_id, service_id, starts_at, ends_at FROM ins\n  UNION ALL\n  SELECT ref, status, client_id, stylist_id, service_id, starts_at, ends_at FROM existing\n)\nSELECT json_build_object(\n  'is_replay',  (SELECT is_replay  FROM checks),\n  'service_ok', (SELECT service_ok FROM checks),\n  'stylist_ok', (SELECT stylist_ok FROM checks),\n  'performs',   (SELECT performs   FROM checks),\n  'hours_ok',   (SELECT hours_ok   FROM checks),\n  'not_past',   (SELECT not_past   FROM checks),\n  'taken',      (SELECT taken      FROM checks),\n  'created',      COALESCE((SELECT bool_or(was_inserted)     FROM ins), false),\n  'raced_replay', COALESCE((SELECT bool_or(NOT was_inserted) FROM ins), false),\n  -- Compare against whichever row this booking_key actually resolved to. On the RACED replay\n  -- path `existing` is empty (our snapshot predates the winner's commit), so COALESCEing to\n  -- true there confirmed a booking whose service, stylist and time were somebody else's. The\n  -- row ON CONFLICT handed back is the authority; only a genuine first insert is a match by\n  -- definition, and anything else defaults to NOT matching.\n  'params_match', COALESCE(\n      (SELECT i.service_id = p.service_id AND i.stylist_id = p.stylist_id AND i.starts_at = win.s\n       FROM ins i, p, win WHERE NOT i.was_inserted),\n      (SELECT e.service_id = p.service_id AND e.stylist_id = p.stylist_id AND e.starts_at = win.s\n       FROM existing e, p, win),\n      (SELECT bool_or(was_inserted) FROM ins),\n      false),\n  'booking', (SELECT json_build_object(\n                'ref', f.ref, 'status', f.status,\n                'client_id', f.client_id,\n                'client_name', COALESCE(c.name, (SELECT client_name FROM p)),\n                'stylist_id', f.stylist_id, 'stylist_name', st.name,\n                'service_id', f.service_id, 'service_name', sv.name,\n                'duration_min', sv.duration_min, 'price_php', sv.price_php,\n                'starts_at_utc',   to_char(f.starts_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),\n                'ends_at_utc',     to_char(f.ends_at   AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),\n                'starts_at_local', to_char(f.starts_at AT TIME ZONE 'Asia/Manila','YYYY-MM-DD HH24:MI'),\n                'ends_at_local',   to_char(f.ends_at   AT TIME ZONE 'Asia/Manila','HH24:MI'))\n              FROM final f\n              -- LEFT, not INNER: a client inserted by the `cli` CTE above is NOT visible to\n              -- this SELECT (every part of one statement reads the same pre-statement\n              -- snapshot), so an INNER JOIN silently drops the booking of any FIRST-TIME\n              -- client — the one case a demo with pre-seeded clients never exercises.\n              LEFT JOIN client  c  ON c.id  = f.client_id\n              JOIN stylist st ON st.id = f.stylist_id\n              JOIN service sv ON sv.id = f.service_id\n              LIMIT 1)\n) AS result;",
+        "options": {
+          "queryReplacement": "={{ [$json.booking_key, $json.client_name, $json.client_phone, $json.channel, $json.channel_user_id, $json.service_id, $json.stylist_id, $json.starts_at, $json.notes] }}"
+        }
+      },
+      "id": "query",
+      "name": "Query",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "sPRRlnWxeFGhEZbe",
+          "name": "Salon Booking Postgres (local)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map the single query row onto the closed response contract:\n//   exactly {ok:true, data} or {ok:false, reason} — never both, never a bare throw.\n// `reason` is a CLOSED ENUM. Raw driver text is never echoed: it can carry the connection\n// string and password, and the agent downstream would read it straight out to a customer.\nconst inputs = $input.all();\nconst checked = $('Validate input').all();\nconst out = [];\nfunction dbReason(errText) {\n  const e = String(errText || '');\n  if (e.includes('appointment_no_double_booking')) return 'slot_taken';\n  if (e.includes('statement timeout') || e.includes('canceling statement')) return 'timeout';\n  return 'db_unavailable';\n}\n\nfor (let i = 0; i < inputs.length; i++) {\n  const v = (checked[i] || checked[0] || {}).json || {};\n  const row = (inputs[i] || {}).json || {};\n  if (v.invalid) { out.push({ json: { ok: false, reason: v.invalid } }); continue; }\n  if (row.error !== undefined || !row.result) {\n    // A lost race past the in-statement pre-check still hits the EXCLUDE constraint; that is\n    // the guard doing its job, so it reads as slot_taken and not as an outage.\n    out.push({ json: { ok: false, reason: dbReason(row.error) } }); continue;\n  }\n  const d = row.result;\n  // Order matters: identity of the request is judged before its contents.\n  if (!d.service_ok)                 { out.push({ json: { ok: false, reason: 'service_not_found' } }); continue; }\n  if (!d.stylist_ok)                 { out.push({ json: { ok: false, reason: 'stylist_not_found' } }); continue; }\n  // Either replay path: the key came back attached to a booking, and if that booking is not\n  // the one being asked for it is a key conflict, not a success. Checking only is_replay\n  // meant the RACED path — where `existing` is empty by construction — returned ok:true\n  // carrying the winner's service, stylist and time.\n  if ((d.is_replay || d.raced_replay) && !d.params_match) {\n    out.push({ json: { ok: false, reason: 'booking_key_conflict' } }); continue;\n  }\n  // raced_replay: another call with this same key committed first and we were handed its row.\n  if (d.is_replay || d.raced_replay) { out.push({ json: { ok: true, data: Object.assign({ idempotent_replay: true }, d.booking) } }); continue; }\n  if (!d.performs)  { out.push({ json: { ok: false, reason: 'stylist_does_not_perform_service' } }); continue; }\n  if (!d.not_past)  { out.push({ json: { ok: false, reason: 'starts_in_the_past' } }); continue; }\n  if (!d.hours_ok)  { out.push({ json: { ok: false, reason: 'outside_business_hours' } }); continue; }\n  if (d.taken)      { out.push({ json: { ok: false, reason: 'slot_taken' } }); continue; }\n  if (!d.created || !d.booking) { out.push({ json: { ok: false, reason: 'not_created' } }); continue; }\n  out.push({ json: { ok: true, data: Object.assign({ idempotent_replay: false }, d.booking) } });\n}\n\n// alwaysOutputData + this guard: the caller ALWAYS receives an item, even when the trigger\n// fired with nothing at all.\nif (out.length === 0) out.push({ json: { ok: false, reason: 'invalid_input' } });\nreturn out;\n"
+      },
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "content": "## 21 · create booking\\n\\n**In** `{booking_key, client:{name, phone?, channel?, channel_user_id?}, service_id, stylist_id, starts_at, notes?}`\\n**Out** `{ok:true, data:{ref, idempotent_replay, …}}`\\n\\n`ends_at` is ALWAYS derived from `service.duration_min` — a caller cannot shorten it to sneak past the double-booking guard. Same `booking_key` + same params replays the original booking; same key + different params is `booking_key_conflict`, never a silent wrong confirmation.\\n\\n`reason`: `invalid_input` · `invalid_timestamp` · `service_not_found` · `stylist_not_found` · `stylist_does_not_perform_service` · `starts_in_the_past` · `outside_business_hours` · `slot_taken` · `booking_key_conflict` · `db_unavailable` · `timeout`",
+        "height": 300,
+        "width": 900,
+        "color": 4
+      },
+      "id": "note-66921",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -340
+      ]
+    }
+  ],
+  "connections": {
+    "When called by the agent": {
+      "main": [
+        [
+          {
+            "node": "Validate input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate input": {
+      "main": [
+        [
+          {
+            "node": "Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {}
+}

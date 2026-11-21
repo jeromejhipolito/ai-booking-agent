@@ -1,0 +1,6 @@
+# Auto-HTTPS in front of n8n. Caddy fetches and renews the certificate itself;
+# point DOMAIN's A record at this host first or the ACME challenge fails.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy n8n:5678
+}

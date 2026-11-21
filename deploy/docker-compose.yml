@@ -1,0 +1,100 @@
+# Production stack for the salon booking agent on a single VPS.
+# Postgres(+pgvector) · Ollama(embeddings, phase 2) · n8n · Caddy(HTTPS)
+#
+#   1) cp ../.env.example ../.env  &&  edit it
+#   2) docker compose --env-file ../.env up -d
+#   3) apply EVERY schema file, in this order — phase3 and phase4 are not optional extras, the
+#      workflows' SQL names notification_log.recipient_ref and the review uniqueness directly:
+#      for f in booking-schema agent-schema phase3-schema phase4-schema seed-demo-salon; do
+#        docker compose exec -T postgres psql -U $POSTGRES_USER -d $POSTGRES_DB < $f.sql
+#      done
+#   4) docker compose exec ollama ollama pull bge-m3      # only needed from phase 2
+#   5) open https://$DOMAIN → create the n8n owner account → import ../workflows/*.json
+#
+# 2 GB RAM is enough for phase 1 (Postgres + n8n). Ollama's embedding model wants ~1.5 GB more.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Extensions only. The schema is applied explicitly (step 3) rather than dropped in
+      # here, so re-deploying never silently rewrites a live salon's data.
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    # Internal only — n8n reaches it at http://ollama:11434 on the compose network.
+
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      # Lose this and every saved credential becomes unreadable.
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - N8N_HOST=${DOMAIN}
+      - N8N_PROTOCOL=https
+      - N8N_PORT=5678
+      - WEBHOOK_URL=https://${DOMAIN}/
+      - N8N_EDITOR_BASE_URL=https://${DOMAIN}/
+      - N8N_PROXY_HOPS=1
+      # The booking SQL pins Asia/Manila itself, so the container clock cannot shift a slot —
+      # this only affects how schedule triggers (phase 3 reminders) are interpreted.
+      - GENERIC_TIMEZONE=${TZ}
+      - TZ=${TZ}
+      - N8N_RUNNERS_ENABLED=true
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      # n8n and ollama are separate containers: 127.0.0.1 inside n8n is n8n, not ollama.
+      - OLLAMA_URL=http://ollama:11434
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - MANAGER_TELEGRAM_CHAT_ID=${MANAGER_TELEGRAM_CHAT_ID}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    expose:
+      - "5678"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - n8n
+    environment:
+      - DOMAIN=${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  postgres_data:
+  ollama_data:
+  n8n_data:
+  caddy_data:
+  caddy_config:

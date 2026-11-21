@@ -1,0 +1,176 @@
+{
+  "name": "90 · dev: tool test harness",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "salon-tool",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "hook",
+      "name": "Dev webhook (POST /webhook/salon-tool)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "salon-tool-dev"
+    },
+    {
+      "parameters": {
+        "jsCode": "// DEV-ONLY harness. Phase 2's chat agent calls these tools directly through Execute Workflow;\n// this webhook exists so the tools can be exercised end-to-end (real trigger -> real sub-workflow\n// -> real Postgres) before any agent exists, and so the QA script can assert their JSON.\nconst IDS = {\n  \"find_availability\": \"@@WF:20 · tool: find availability@@\",\n  \"create_booking\": \"@@WF:21 · tool: create booking@@\",\n  \"cancel_booking\": \"@@WF:22 · tool: cancel booking@@\",\n  \"find_stylist_alternatives\": \"@@WF:23 · tool: find stylist alternatives@@\",\n  \"chat\": \"@@WF:10 · Booking Agent Core@@\",\n  \"send_notification\": \"@@WF:39 · send a notice (exactly once)@@\",\n  \"reminder_sweep\": \"@@WF:30 · scheduled reminders@@\",\n  \"backfill_run\": \"@@WF:31 · cancellation backfill@@\",\n  \"stylist_decline\": \"@@WF:32 · stylist decline → client consent@@\",\n  \"reassign_booking\": \"@@WF:24 · tool: reassign booking@@\",\n  \"review_sweep\": \"@@WF:40 · ask for a review@@\",\n  \"submit_review\": \"@@WF:41 · tool: submit review@@\"\n};\n// This endpoint can invoke create_booking, cancel_booking, reassign_booking and submit_review\n// with caller-supplied arguments, and refs come from a sequence, so they are guessable. It\n// therefore fails CLOSED: no HARNESS_TOKEN configured means it refuses everything, and the\n// importer never activates it. Set HARNESS_TOKEN only to run the verify scripts.\nlet expected = '';\ntry { expected = $env.HARNESS_TOKEN || ''; } catch (e) { expected = ''; }\nconst headers = (($input.first() || {}).json || {}).headers || {};\nconst supplied = String(headers['x-harness-token'] || '');\nif (!expected) {\n  return [{ json: { ok: false, reason: 'harness_token_not_configured' } }];\n}\nif (supplied !== expected) {\n  return [{ json: { ok: false, reason: 'forbidden' } }];\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const body = (item.json && item.json.body) || {};\n  const tool = String(body.tool || '').trim();\n  const id = IDS[tool];\n  if (!id) return [{ json: { _unknown_tool: tool, ok: false, reason: 'unknown_tool' } }];\n  // `inputs: [...]` fans out, so the multi-item contract can be exercised: a Code node that\n  // reads $json instead of $input.all() collapses this to one item and silently drops bookings.\n  const many = Array.isArray(body.inputs) ? body.inputs : null;\n  for (const one of (many || [body.input || {}])) {\n    out.push({ json: Object.assign({}, one, { _workflow_id: id }) });\n  }\n}\nreturn out;\n"
+      },
+      "id": "route",
+      "name": "Route to tool",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        230,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "={{ $json._workflow_id }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "call",
+      "name": "Call the tool",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        620,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        850,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 90 · dev test harness (not part of the product)\\n\\n`POST http://localhost:5678/webhook/salon-tool`\\n```json\\n{ \"tool\": \"chat\", \"input\": { \"user_key\": \"telegram:demo\", \"text\": \"do you do rebonding?\" } }\\n```\\n\\nFires the real sub-workflow through Execute Workflow, so what you get back is exactly what the phase-2 agent will get. `scripts/verify-tools.sh` drives every AC through this endpoint.\\n\\nDeactivate it before any public deployment — it is an unauthenticated trigger.",
+        "height": 300,
+        "width": 780,
+        "color": 3
+      },
+      "id": "note",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -350
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-wf",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              },
+              "leftValue": "={{ $json._workflow_id }}",
+              "rightValue": ""
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "gate",
+      "name": "Routed to a tool?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        430,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Dev webhook (POST /webhook/salon-tool)": {
+      "main": [
+        [
+          {
+            "node": "Route to tool",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route to tool": {
+      "main": [
+        [
+          {
+            "node": "Routed to a tool?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call the tool": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Routed to a tool?": {
+      "main": [
+        [
+          {
+            "node": "Call the tool",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {}
+}
